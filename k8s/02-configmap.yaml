@@ -1,0 +1,48 @@
+# Shared environment variables for all three ML pipeline services.
+# Services read these to locate MinIO and configure BERT hyperparameters.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ml-pipeline-config
+  namespace: ml-pipeline
+data:
+  # S3-compatible endpoint (MinIO inside the cluster)
+  S3_ENDPOINT_URL: "http://minio:9000"
+  S3_BUCKET: "ml-provenance"
+  AWS_DEFAULT_REGION: "us-east-1"
+
+  # BERT model to use (data-ingestion doesn't need this)
+  BERT_MODEL: "bert-base-uncased"
+  MAX_SEQ_LENGTH: "128"
+
+  # Data ingestion defaults
+  DATASET_NAME: "imdb"
+
+  # Preprocessing
+  CHUNK_SIZE: "64"
+
+  # Fine-tuning hyperparameters (keep small for local dev)
+  EPOCHS: "3"
+  BATCH_SIZE: "16"
+  LEARNING_RATE: "2e-5"
+  WARMUP_RATIO: "0.1"
+
+  # HuggingFace cache (backed by the shared PVC below)
+  HF_HOME: "/app/cache"
+  TRANSFORMERS_CACHE: "/app/cache"
+
+  # Atlas provenance sidecar (receives C2PA manifest requests from pipeline services)
+  ATLAS_SIDECAR_URL: "http://atlas-sidecar:8004"
+---
+# Shared PVC for HuggingFace model weights (avoids repeated downloads)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-cache-pvc
+  namespace: ml-pipeline
+spec:
+  accessModes:
+    - ReadWriteMany   # shared across preprocessing + fine-tuning pods
+  resources:
+    requests:
+      storage: 5Gi

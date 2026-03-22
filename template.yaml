@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ML Provenance Pipeline – AWS Cloud Resources
+
+  Provisions S3 buckets for ML artifacts (raw data, tokenized data, models)
+  and Lambda functions for pipeline orchestration. The three core services
+  (data-ingestion, preprocessing, fine-tuning) run in Kubernetes (EKS) and
+  use these S3 buckets for inter-stage artifact sharing.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: ml-provenance-pipeline
+    Description: S3 bucket for all ML pipeline artifacts (raw, preprocessed, models)
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  DataIngestionEndpoint:
+    Type: String
+    Default: http://localhost:8001
+    Description: URL of the data-ingestion service (Kubernetes LoadBalancer or port-forward)
+
+  PreprocessingEndpoint:
+    Type: String
+    Default: http://localhost:8002
+    Description: URL of the preprocessing service
+
+  FineTuningEndpoint:
+    Type: String
+    Default: http://localhost:8003
+    Description: URL of the fine-tuning service
+
+Resources:
+
+  # ── S3 Bucket for all ML artifacts ─────────────────────────────────────────
+  MLArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled          # track artifact versions for provenance
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawData
+            Prefix: raw/
+            Status: Enabled
+            ExpirationInDays: 30  # raw data: keep 30 days
+          - Id: ArchiveModels
+            Prefix: models/
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+            Function: !GetAtt IngestWatcherFunction.Arn
+      Tags:
+        - Key: project
+          Value: ml-provenance
+        - Key: environment
+          Value: !Ref Environment
+
+  # ── SSM Parameters (services read these to find the bucket) ──────────────
+  BucketNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/ml-provenance/${Environment}/S3_BUCKET"
+      Type: String
+      Value: !Ref MLArtifactsBucket
+
+  # ── IAM Role shared by all Lambda orchestration functions ──────────────────
+  PipelineOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ArtifactsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:HeadObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt MLArtifactsBucket.Arn
+                  - !Sub "${MLArtifactsBucket.Arn}/*"
+
+  # ── Lambda: watches for new raw data and triggers preprocessing ────────────
+  IngestWatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt PipelineOrchestratorRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          PREPROCESSING_ENDPOINT: !Ref PreprocessingEndpoint
+          S3_BUCKET: !Ref MLArtifactsBucket
+      InlineCode: |
+        import os, json, urllib.request
+
+        def handler(event, context):
+            endpoint = os.environ["PREPROCESSING_ENDPOINT"]
+            for record in event.get("Records", []):
+                key = record["s3"]["object"]["key"]
+                split = key.replace("raw/", "").replace("_data.json", "")
+                print(f"New raw data detected: {key}  split={split}")
+                req = urllib.request.Request(
+                    f"{endpoint}/preprocess?split={split}",
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = json.loads(resp.read())
+                    print(f"Preprocessing job queued: {body}")
+            return {"statusCode": 200}
+
+  # Allow S3 to invoke IngestWatcherFunction
+  IngestWatcherS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt IngestWatcherFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt MLArtifactsBucket.Arn
+
+  # ── Lambda: HTTP API to trigger each pipeline stage ────────────────────────
+  PipelineOrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Role: !GetAtt PipelineOrchestratorRole.Arn
+      Timeout: 29
+      Environment:
+        Variables:
+          INGEST_ENDPOINT:     !Ref DataIngestionEndpoint
+          PREPROC_ENDPOINT:    !Ref PreprocessingEndpoint
+          FINETUNE_ENDPOINT:   !Ref FineTuningEndpoint
+          S3_BUCKET:           !Ref MLArtifactsBucket
+      Events:
+        ApiIngest:
+          Type: Api
+          Properties:
+            Path: /pipeline/ingest
+            Method: post
+        ApiPreprocess:
+          Type: Api
+          Properties:
+            Path: /pipeline/preprocess
+            Method: post
+        ApiTrain:
+          Type: Api
+          Properties:
+            Path: /pipeline/train
+            Method: post
+        ApiPredict:
+          Type: Api
+          Properties:
+            Path: /pipeline/predict
+            Method: post
+      InlineCode: |
+        import os, json, urllib.request, urllib.parse
+
+        ENDPOINTS = {
+            "ingest":     os.environ["INGEST_ENDPOINT"],
+            "preprocess": os.environ["PREPROC_ENDPOINT"],
+            "train":      os.environ["FINETUNE_ENDPOINT"],
+            "predict":    os.environ["FINETUNE_ENDPOINT"],
+        }
+
+        def forward(path, body_bytes, method="POST"):
+            stage = path.split("/")[-1]
+            base  = ENDPOINTS.get(stage, "")
+            url   = f"{base}/{stage}"
+            req   = urllib.request.Request(url, data=body_bytes, method=method,
+                                           headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read())
+
+        def handler(event, context):
+            path = event.get("path", "/")
+            body = (event.get("body") or "{}").encode()
+            try:
+                result = forward(path, body)
+                return {"statusCode": 200,
+                        "body": json.dumps(result),
+                        "headers": {"Content-Type": "application/json"}}
+            except Exception as exc:
+                return {"statusCode": 502,
+                        "body": json.dumps({"error": str(exc)})}
+
+Outputs:
+  ArtifactsBucket:
+    Value: !Ref MLArtifactsBucket
+    Description: S3 bucket for ML pipeline artifacts
+
+  ArtifactsBucketArn:
+    Value: !GetAtt MLArtifactsBucket.Arn
+    Description: ARN of the ML artifacts bucket
+
+  OrchestratorApi:
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    Description: API Gateway URL for pipeline orchestration
+    Export:
+      Name: !Sub "${AWS::StackName}-OrchestratorApi"

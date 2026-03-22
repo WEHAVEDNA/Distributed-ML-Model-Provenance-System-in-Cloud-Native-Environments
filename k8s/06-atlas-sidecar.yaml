@@ -1,0 +1,115 @@
+# Atlas Provenance Sidecar – collects C2PA manifests for every pipeline artifact.
+# Depends on MinIO being available; pipeline services depend on this being ready.
+#
+# The sidecar:
+#   - builds atlas-cli from source (Rust, multi-stage Docker build)
+#   - wraps it in a FastAPI HTTP service on port 8004
+#   - stores signed C2PA manifests in a dedicated PVC (/manifests/atlas)
+#   - exposes /collect/{dataset|pipeline|model}, /registry, /export, /verify endpoints
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlas-sidecar
+  namespace: ml-pipeline
+  labels:
+    app: atlas-sidecar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atlas-sidecar
+  template:
+    metadata:
+      labels:
+        app: atlas-sidecar
+    spec:
+      initContainers:
+        # Ensure the manifests directory exists with correct permissions before
+        # the sidecar starts (the PVC may be empty on first run).
+        - name: init-manifests-dir
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /manifests/atlas && chmod 777 /manifests/atlas"]
+          volumeMounts:
+            - name: atlas-manifests
+              mountPath: /manifests
+      containers:
+        - name: atlas-sidecar
+          image: ml-provenance/atlas-sidecar:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8004
+          env:
+            - name: MANIFESTS_DIR
+              value: "/manifests/atlas"
+            - name: S3_ENDPOINT_URL
+              value: "http://minio:9000"
+            - name: S3_BUCKET
+              value: "ml-provenance"
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: secret-key
+          volumeMounts:
+            - name: atlas-manifests
+              mountPath: /manifests
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: atlas-manifests
+          persistentVolumeClaim:
+            claimName: atlas-manifests-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlas-sidecar
+  namespace: ml-pipeline
+  labels:
+    app: atlas-sidecar
+spec:
+  selector:
+    app: atlas-sidecar
+  ports:
+    - name: http
+      port: 8004
+      targetPort: 8004
+  type: ClusterIP
+---
+# PVC for C2PA manifests – ReadWriteOnce is sufficient (single sidecar pod).
+# Increase storage if manifests grow large (each manifest ~10-50 KB).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: atlas-manifests-pvc
+  namespace: ml-pipeline
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

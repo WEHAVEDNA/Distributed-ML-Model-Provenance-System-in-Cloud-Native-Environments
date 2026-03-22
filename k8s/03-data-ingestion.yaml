@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-ingestion
+  namespace: ml-pipeline
+  labels:
+    app: data-ingestion
+    pipeline-stage: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-ingestion
+  template:
+    metadata:
+      labels:
+        app: data-ingestion
+        pipeline-stage: "1"
+    spec:
+      containers:
+        - name: data-ingestion
+          image: ml-provenance/data-ingestion:latest
+          imagePullPolicy: IfNotPresent   # use local image in minikube/kind
+          ports:
+            - containerPort: 8001
+          envFrom:
+            - configMapRef:
+                name: ml-pipeline-config
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: secret-key
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /app/cache
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-ingestion
+  namespace: ml-pipeline
+  labels:
+    app: data-ingestion
+spec:
+  selector:
+    app: data-ingestion
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001
+  type: ClusterIP

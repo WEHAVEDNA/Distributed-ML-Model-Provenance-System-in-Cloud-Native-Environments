@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fine-tuning
+  namespace: ml-pipeline
+  labels:
+    app: fine-tuning
+    pipeline-stage: "3"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fine-tuning
+  template:
+    metadata:
+      labels:
+        app: fine-tuning
+        pipeline-stage: "3"
+    spec:
+      containers:
+        - name: fine-tuning
+          image: ml-provenance/fine-tuning:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8003
+          envFrom:
+            - configMapRef:
+                name: ml-pipeline-config
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-secret
+                  key: secret-key
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /app/cache
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+            limits:
+              memory: "8Gi"    # BERT fine-tuning is memory-intensive
+              cpu: "4000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      volumes:
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: hf-cache-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fine-tuning
+  namespace: ml-pipeline
+  labels:
+    app: fine-tuning
+spec:
+  selector:
+    app: fine-tuning
+  ports:
+    - name: http
+      port: 8003
+      targetPort: 8003
+  type: ClusterIP

@@ -1,0 +1,5 @@
+pytest==8.2.0
+requests==2.31.0
+pytest-timeout==2.3.1
+
+# install with: pip install -r tests/requirements-test.txt
