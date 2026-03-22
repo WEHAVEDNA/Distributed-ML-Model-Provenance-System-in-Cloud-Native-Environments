@@ -92,9 +92,13 @@ def _do_ingest(job_id: str, split: str, num_samples: int):
     try:
         log.info("[%s] Loading %s dataset split=%s samples=%d", job_id, DATASET_NAME, split, num_samples)
         dataset = load_dataset(DATASET_NAME, split=split)
-        # Shuffle before slicing: IMDB is ordered (all negatives first, then
-        # all positives), so an unshuffled head is entirely one class.
-        dataset = dataset.shuffle(seed=42).select(range(min(num_samples, len(dataset))))
+        # Stratified sampling: take exactly half negative (label=0) and half
+        # positive (label=1) to guarantee class balance regardless of num_samples.
+        half = num_samples // 2
+        neg = dataset.filter(lambda x: x["label"] == 0).shuffle(seed=42).select(range(half))
+        pos = dataset.filter(lambda x: x["label"] == 1).shuffle(seed=42).select(range(half))
+        import datasets as hf_datasets
+        dataset = hf_datasets.concatenate_datasets([neg, pos]).shuffle(seed=42)
 
         records = [{"text": item["text"], "label": item["label"]} for item in dataset]
 
