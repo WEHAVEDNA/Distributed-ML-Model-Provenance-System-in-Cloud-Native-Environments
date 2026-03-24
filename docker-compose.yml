@@ -1,0 +1,145 @@
+# Local development stack – no Kubernetes required.
+# All services share the ml-pipeline network and MinIO as S3 storage.
+#
+# Usage:
+#   docker compose up --build
+#   ./scripts/run_pipeline.sh
+
+networks:
+  ml-pipeline:
+    driver: bridge
+
+volumes:
+  minio-data:
+  hf-cache:       # shared HuggingFace model weight cache across all ML services
+  atlas-manifests: # C2PA manifests written by atlas-sidecar (Step 3)
+
+x-ml-env: &ml-env
+  MINIO_ENDPOINT:        "http://minio:9000"
+  ARTIFACT_BUCKET:       "ml-provenance"
+  MINIO_ACCESS_KEY:      "minioadmin"
+  MINIO_SECRET_KEY:      "minioadmin"
+  MINIO_REGION:          "us-east-1"
+  BERT_MODEL:            "distilbert-base-uncased"
+  MAX_SEQ_LENGTH:        "64"
+  HF_HOME:               "/app/cache"
+  ATLAS_SIDECAR_URL:     ""   # set to "http://atlas-sidecar:8004" when Step 3 is ready
+
+services:
+
+  # ── MinIO (S3-compatible object store) ──────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-04-06T05-26-02Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    # Ports intentionally not exposed to host — pipeline services
+    # communicate with MinIO container-to-container via http://minio:9000.
+    # Uncomment below if you need host access to MinIO console/API:
+    # ports:
+    #   - "9010:9000"
+    #   - "9011:9001" 
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - ml-pipeline
+
+  # ── MinIO bucket initialisation (runs once then exits) ──────────────────────
+  minio-init:
+    image: minio/mc:RELEASE.2024-04-18T16-45-29Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Waiting for MinIO...' &&
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do
+          echo 'MinIO not ready, retrying in 3s...' && sleep 3;
+        done &&
+        mc mb --ignore-existing local/ml-provenance &&
+        echo 'Bucket ml-provenance ready'
+      "
+    networks:
+      - ml-pipeline
+
+  # ── Stage 1: Data Ingestion ──────────────────────────────────────────────────
+  data-ingestion:
+    build:
+      context: ./services/data-ingestion
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      <<: *ml-env
+      DATASET_NAME: "imdb"
+    volumes:
+      - hf-cache:/app/cache
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=4)"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ml-pipeline
+
+  # ── Stage 2: Preprocessing ───────────────────────────────────────────────────
+  preprocessing:
+    build:
+      context: ./services/preprocessing
+      dockerfile: Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      <<: *ml-env
+      CHUNK_SIZE: "64"
+    volumes:
+      - hf-cache:/app/cache
+    depends_on:
+      data-ingestion:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=4)"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ml-pipeline
+
+  # ── Stage 3: Fine-Tuning & Inference ────────────────────────────────────────
+  fine-tuning:
+    build:
+      context: ./services/fine-tuning
+      dockerfile: Dockerfile
+    ports:
+      - "8003:8003"
+    environment:
+      <<: *ml-env
+      EPOCHS:        "2"
+      BATCH_SIZE:    "16"
+      LEARNING_RATE: "2e-5"
+      WARMUP_RATIO:  "0.1"
+    volumes:
+      - hf-cache:/app/cache
+    depends_on:
+      preprocessing:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=4)"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ml-pipeline
