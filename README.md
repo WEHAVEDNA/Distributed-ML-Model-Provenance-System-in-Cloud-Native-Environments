@@ -84,6 +84,7 @@ Distributed-ML-Model-Provenance-System-in-Cloud-Native-Environments/
 ### Prerequisites
 
 - Docker Desktop running
+- Create .env file in project root directory with contents 'COMPOSE_PROJECT_NAME=atlas'
 
 ### Run
 
