@@ -1,5 +1,9 @@
 # Distributed ML Model Provenance System in Cloud-Native Environments
 
+Here's the Link to our Demo 1 presentation: https://docs.google.com/presentation/d/1z5usLUe9r3ex-ovyxyOwZE1G7A_tVfEOVQuWLKoFlhg/edit?usp=sharing
+
+Here's the Link to our Demo 2 presentation: https://docs.google.com/presentation/d/1WfeDlM877Tw3Msrw_t-0FO3Swb3vk92SMZvVm914wR0/edit?slide=id.g3966e706cf1_0_0#slide=id.g3966e706cf1_0_0
+
 **BU EC528 · Spring 2026**  
 Intel Labs mentored project — extending [Atlas CLI](https://github.com/IntelLabs/atlas-cli) into a cloud-native distributed provenance system.
 
@@ -87,9 +91,6 @@ Distributed-ML-Model-Provenance-System-in-Cloud-Native-Environments/
 # Start all services in the background
 docker compose up -d
 
-# Confirm everything is healthy (~30 seconds)
-docker compose ps
-
 # Run the full pipeline with 50 samples
 ./scripts/run_pipeline.sh --samples 50
 ```
@@ -100,12 +101,12 @@ Expected output:
 [INFO]  All services healthy.
 ════════════════════════════════════════════════════
  ML Provenance Pipeline
- samples=200  split=train
+ samples=50  split=train
 ════════════════════════════════════════════════════
 
 [INFO]  Stage 1 – Data Ingestion (IMDB, 200 samples)
 [INFO]  Data Ingestion: completed ✓
-  samples : 200
+  samples : 50
   sha256  : a3f9c2...
   s3_uri  : s3://ml-provenance/raw/train_data.json
 
@@ -116,8 +117,9 @@ Expected output:
 [INFO]  Fine-Tuning: completed ✓
 
 [INFO]  Smoke test – Inference
-  This movie was absolutely fantastic!...  → positive (0.9823)
-  What a terrible waste of time...         → negative (0.9541)
+  This movie was absolutely fantastic! The acting was superb.  → negative (0.6930)
+  What a terrible waste of time. I fell asleep after 20 minute → negative (0.6624)
+  An okay film, nothing special but watchable enough.          → negative (0.6786)
 
 [INFO]  Pipeline complete ✓
 ```
@@ -125,6 +127,9 @@ Expected output:
 ### Useful commands
 
 ```bash
+# Confirm everything is healthy
+docker compose ps
+
 # Stream logs from all services
 docker compose logs -f
 
