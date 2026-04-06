@@ -9,7 +9,7 @@ This is the "golden path" test for the ML Provenance project.
 
 import pytest
 import requests
-from conftest import INGEST_URL, PREPROC_URL, FINETUNE_URL
+from conftest import FINETUNE_URL, INGEST_URL, PIPELINE_ID, PREPROC_URL
 
 
 @pytest.mark.slow
@@ -21,7 +21,11 @@ class TestProvenance:
     """
 
     def test_ingestion_meta_recorded(self, ingest_job):
-        r = requests.get(f"{INGEST_URL}/status", params={"split": "train"}, timeout=10)
+        r = requests.get(
+            f"{INGEST_URL}/status",
+            params={"split": "train", "pipeline_id": PIPELINE_ID},
+            timeout=10,
+        )
         body = r.json()
         assert body["available"] is True
         meta = body["meta"]
@@ -34,14 +38,18 @@ class TestProvenance:
         assert meta["ingested_at"].endswith("Z")
 
     def test_preprocessing_links_to_ingestion(self, ingest_job, preprocess_job):
-        r = requests.get(f"{PREPROC_URL}/status", params={"split": "train"}, timeout=10)
+        r = requests.get(
+            f"{PREPROC_URL}/status",
+            params={"split": "train", "pipeline_id": PIPELINE_ID},
+            timeout=10,
+        )
         meta = r.json()["meta"]
         # The preprocessing metadata must reference the raw data artifact
         assert ingest_job["s3_uri"] in meta["source_uri"] or \
-               "raw/train_data.json" in meta["source_uri"]
+               f"pipelines/{PIPELINE_ID}/raw/train_data.json" in meta["source_uri"]
 
     def test_model_info_references_training_split(self, train_job):
-        r = requests.get(f"{FINETUNE_URL}/model/info", timeout=10)
+        r = requests.get(f"{FINETUNE_URL}/model/info", params={"pipeline_id": PIPELINE_ID}, timeout=10)
         info = r.json()
         assert info["training_split"] == "train"
 
@@ -73,7 +81,11 @@ class TestEndToEndPipeline:
 
     @pytest.mark.parametrize("text, expected_label", INFERENCE_CASES)
     def test_inference_label_correct(self, train_job, require_sufficient_samples, text, expected_label):
-        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": text}, timeout=30)
+        r = requests.post(
+            f"{FINETUNE_URL}/predict",
+            json={"text": text, "pipeline_id": PIPELINE_ID},
+            timeout=30,
+        )
         assert r.status_code == 200
         body = r.json()
         assert body["label"] == expected_label, (
@@ -85,7 +97,11 @@ class TestEndToEndPipeline:
     @pytest.mark.parametrize("text, expected_label", INFERENCE_CASES)
     def test_inference_confidence_above_chance(self, train_job, text, expected_label):
         """Model must be at least slightly better than random (>50%) regardless of sample count."""
-        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": text}, timeout=30)
+        r = requests.post(
+            f"{FINETUNE_URL}/predict",
+            json={"text": text, "pipeline_id": PIPELINE_ID},
+            timeout=30,
+        )
         assert r.status_code == 200
         assert r.json()["confidence"] > 0.50, (
             f"Confidence ({r.json()['confidence']:.3f}) not above chance for: {text!r}"

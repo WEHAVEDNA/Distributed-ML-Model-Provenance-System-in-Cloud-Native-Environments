@@ -17,6 +17,25 @@ spec:
         app: preprocessing
         pipeline-stage: "2"
     spec:
+      initContainers:
+        - name: wait-for-minio
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -q -O /dev/null http://minio:9000/minio/health/ready; do
+                echo "waiting for minio…"; sleep 3
+              done
+        - name: wait-for-atlas-sidecar
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -q -O /dev/null http://atlas-sidecar:8004/health; do
+                echo "waiting for atlas-sidecar…"; sleep 3
+              done
       containers:
         - name: preprocessing
           image: ml-provenance/preprocessing:latest

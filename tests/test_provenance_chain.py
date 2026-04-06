@@ -19,7 +19,12 @@ import pytest
 import requests
 
 from conftest import (
-    INGEST_URL, PREPROC_URL, FINETUNE_URL, SIDECAR_URL,
+    FINETUNE_URL,
+    INGEST_URL,
+    PIPELINE_ID,
+    PREPROC_URL,
+    SIDECAR_URL,
+    model_uri,
 )
 
 PIPELINE_STAGES = ["data-ingestion", "preprocessing", "fine-tuning"]
@@ -39,7 +44,7 @@ class TestLineageEndpointSmoke:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_lineage_schema(self):
-        body = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()
+        body = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert "chain" in body, "Missing 'chain' key"
         assert "stages_complete" in body, "Missing 'stages_complete' key"
         assert "chain_complete" in body, "Missing 'chain_complete' key"
@@ -51,7 +56,7 @@ class TestLineageEndpointSmoke:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_lineage_chain_entries_have_required_fields(self):
-        chain = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()["chain"]
+        chain = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()["chain"]
         for entry in chain:
             assert "stage" in entry, f"Missing 'stage' in entry: {entry}"
             assert "artifact_uri" in entry, f"Missing 'artifact_uri' in entry: {entry}"
@@ -61,7 +66,11 @@ class TestLineageEndpointSmoke:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_lineage_stages_complete_only_contains_known_stages(self):
-        stages_complete = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()["stages_complete"]
+        stages_complete = requests.get(
+            f"{SIDECAR_URL}/lineage",
+            params={"pipeline_id": PIPELINE_ID},
+            timeout=5,
+        ).json()["stages_complete"]
         for s in stages_complete:
             assert s in PIPELINE_STAGES, f"Unknown stage in stages_complete: {s!r}"
 
@@ -72,13 +81,17 @@ class TestPipelineStatusSmoke:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_pipeline_status_returns_200(self):
-        r = requests.get(f"{SIDECAR_URL}/pipeline/status", timeout=5)
+        r = requests.get(f"{SIDECAR_URL}/pipeline/status", params={"pipeline_id": PIPELINE_ID}, timeout=5)
         assert r.status_code == 200
 
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_pipeline_status_schema(self):
-        body = requests.get(f"{SIDECAR_URL}/pipeline/status", timeout=5).json()
+        body = requests.get(
+            f"{SIDECAR_URL}/pipeline/status",
+            params={"pipeline_id": PIPELINE_ID},
+            timeout=5,
+        ).json()
         assert "stages" in body
         assert "chain_complete" in body
         assert isinstance(body["chain_complete"], bool)
@@ -86,14 +99,22 @@ class TestPipelineStatusSmoke:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_pipeline_status_all_stages_present(self):
-        stages = requests.get(f"{SIDECAR_URL}/pipeline/status", timeout=5).json()["stages"]
+        stages = requests.get(
+            f"{SIDECAR_URL}/pipeline/status",
+            params={"pipeline_id": PIPELINE_ID},
+            timeout=5,
+        ).json()["stages"]
         for s in PIPELINE_STAGES:
             assert s in stages, f"Stage {s!r} missing from /pipeline/status"
 
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_pipeline_status_stage_fields(self):
-        stages = requests.get(f"{SIDECAR_URL}/pipeline/status", timeout=5).json()["stages"]
+        stages = requests.get(
+            f"{SIDECAR_URL}/pipeline/status",
+            params={"pipeline_id": PIPELINE_ID},
+            timeout=5,
+        ).json()["stages"]
         for s in PIPELINE_STAGES:
             entry = stages[s]
             assert "done" in entry, f"Missing 'done' for stage {s}"
@@ -118,8 +139,9 @@ class TestServiceProvenanceEndpoint:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_data_ingestion_provenance_schema(self):
-        body = requests.get(f"{INGEST_URL}/provenance", timeout=5).json()
+        body = requests.get(f"{INGEST_URL}/provenance", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert body["service"] == "data-ingestion"
+        assert body["pipeline_id"] == PIPELINE_ID
         assert "manifest_id" in body    # may be None before first ingest
 
     @pytest.mark.smoke
@@ -131,8 +153,9 @@ class TestServiceProvenanceEndpoint:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_preprocessing_provenance_schema(self):
-        body = requests.get(f"{PREPROC_URL}/provenance", timeout=5).json()
+        body = requests.get(f"{PREPROC_URL}/provenance", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert body["service"] == "preprocessing"
+        assert body["pipeline_id"] == PIPELINE_ID
         assert "manifest_id" in body
 
     @pytest.mark.smoke
@@ -144,8 +167,9 @@ class TestServiceProvenanceEndpoint:
     @pytest.mark.smoke
     @pytest.mark.timeout(10)
     def test_fine_tuning_provenance_schema(self):
-        body = requests.get(f"{FINETUNE_URL}/provenance", timeout=5).json()
+        body = requests.get(f"{FINETUNE_URL}/provenance", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert body["service"] == "fine-tuning"
+        assert body["pipeline_id"] == PIPELINE_ID
         assert "manifest_id" in body
 
 
@@ -162,7 +186,7 @@ class TestLineageAfterPipeline:
     @pytest.mark.wired
     @pytest.mark.timeout(60)
     def test_lineage_includes_ingestion_stage(self, ingest_job):
-        lineage = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()
+        lineage = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert "data-ingestion" in lineage["stages_complete"], (
             "data-ingestion not in stages_complete after ingest_job completed.\n"
             "Check ATLAS_SIDECAR_URL in the data-ingestion container."
@@ -171,7 +195,7 @@ class TestLineageAfterPipeline:
     @pytest.mark.wired
     @pytest.mark.timeout(60)
     def test_lineage_includes_preprocessing_stage(self, preprocess_job):
-        lineage = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()
+        lineage = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert "preprocessing" in lineage["stages_complete"], (
             "preprocessing not in stages_complete after preprocess_job completed."
         )
@@ -183,7 +207,7 @@ class TestLineageAfterPipeline:
         Entries in the chain must appear in pipeline stage order:
         data-ingestion before preprocessing before fine-tuning.
         """
-        chain = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()["chain"]
+        chain = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()["chain"]
         stages_in_chain = [e["stage"] for e in chain]
         # Filter to known pipeline stages, preserving order
         ordered = [s for s in PIPELINE_STAGES if s in stages_in_chain]
@@ -201,7 +225,11 @@ class TestLineageAfterPipeline:
     @pytest.mark.wired
     @pytest.mark.timeout(60)
     def test_pipeline_status_ingestion_done(self, ingest_job):
-        stages = requests.get(f"{SIDECAR_URL}/pipeline/status", timeout=5).json()["stages"]
+        stages = requests.get(
+            f"{SIDECAR_URL}/pipeline/status",
+            params={"pipeline_id": PIPELINE_ID},
+            timeout=5,
+        ).json()["stages"]
         assert stages["data-ingestion"]["done"], (
             "data-ingestion.done is False after ingest_job completed."
         )
@@ -210,7 +238,11 @@ class TestLineageAfterPipeline:
     @pytest.mark.wired
     @pytest.mark.timeout(60)
     def test_pipeline_status_preprocessing_done(self, preprocess_job):
-        stages = requests.get(f"{SIDECAR_URL}/pipeline/status", timeout=5).json()["stages"]
+        stages = requests.get(
+            f"{SIDECAR_URL}/pipeline/status",
+            params={"pipeline_id": PIPELINE_ID},
+            timeout=5,
+        ).json()["stages"]
         assert stages["preprocessing"]["done"], (
             "preprocessing.done is False after preprocess_job completed."
         )
@@ -219,7 +251,7 @@ class TestLineageAfterPipeline:
     @pytest.mark.timeout(60)
     def test_ingest_service_provenance_populated(self, ingest_job):
         """After wired ingest, the data-ingestion service's /provenance has a manifest_id."""
-        body = requests.get(f"{INGEST_URL}/provenance", timeout=5).json()
+        body = requests.get(f"{INGEST_URL}/provenance", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert body["manifest_id"] is not None, (
             "data-ingestion /provenance returned manifest_id=None after ingest_job.\n"
             "Ensure ATLAS_SIDECAR_URL is set in the data-ingestion container."
@@ -228,7 +260,7 @@ class TestLineageAfterPipeline:
     @pytest.mark.wired
     @pytest.mark.timeout(60)
     def test_preprocessing_service_provenance_populated(self, preprocess_job):
-        body = requests.get(f"{PREPROC_URL}/provenance", timeout=5).json()
+        body = requests.get(f"{PREPROC_URL}/provenance", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert body["manifest_id"] is not None, (
             "preprocessing /provenance returned manifest_id=None after preprocess_job."
         )
@@ -237,7 +269,7 @@ class TestLineageAfterPipeline:
     @pytest.mark.slow
     @pytest.mark.timeout(7200)
     def test_full_chain_complete_after_training(self, train_job):
-        lineage = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()
+        lineage = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert lineage["chain_complete"] is True, (
             f"chain_complete is False after full pipeline run.\n"
             f"stages_complete: {lineage['stages_complete']}"
@@ -261,11 +293,15 @@ class TestLineageAfterPipeline:
         is large), so we check the sidecar registry first and accept a populated
         in-memory manifest_id as a bonus indicator.
         """
-        model_uri = "s3://ml-provenance/models/bert-imdb/model.pt"
-        registry = requests.get(f"{SIDECAR_URL}/registry", timeout=5).json()
-        assert model_uri in registry and registry[model_uri].get("manifest_id"), (
+        registry = requests.get(
+            f"{SIDECAR_URL}/registry",
+            params={"pipeline_id": PIPELINE_ID},
+            timeout=5,
+        ).json()
+        expected_model_uri = model_uri()
+        assert expected_model_uri in registry and registry[expected_model_uri].get("manifest_id"), (
             f"No fine-tuning manifest in sidecar registry after train_job.\n"
-            f"Expected URI: {model_uri}\n"
+            f"Expected URI: {expected_model_uri}\n"
             f"Check ATLAS_SIDECAR_URL in the fine-tuning container and sidecar logs."
         )
 
@@ -274,7 +310,7 @@ class TestLineageAfterPipeline:
     @pytest.mark.timeout(7200)
     def test_manifest_ids_are_distinct_across_stages(self, train_job):
         """Each stage must produce a different manifest ID (no accidental sharing)."""
-        lineage = requests.get(f"{SIDECAR_URL}/lineage", timeout=5).json()
+        lineage = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         ids = [e["manifest_id"] for e in lineage["chain"] if e.get("manifest_id")]
         # Allow same artifact collected multiple times to overwrite; just check
         # that if all three stages are present their IDs differ.

@@ -16,18 +16,23 @@ Covers:
 
 import pytest
 import requests
-from conftest import FINETUNE_URL, wait_for_job, TRAIN_TIMEOUT
+from conftest import FINETUNE_URL, PIPELINE_ID, model_uri, wait_for_job, TRAIN_TIMEOUT
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
 class TestTrainingJobLifecycle:
     def test_train_returns_job_id(self, preprocess_job):
-        r = requests.post(f"{FINETUNE_URL}/train", params={"split": "train"}, timeout=10)
+        r = requests.post(
+            f"{FINETUNE_URL}/train",
+            params={"split": "train", "pipeline_id": PIPELINE_ID},
+            timeout=10,
+        )
         assert r.status_code == 200
         body = r.json()
         assert "job_id" in body
         assert body["status"] in ("queued", "running")
         assert "device" in body
+        assert body["pipeline_id"] == PIPELINE_ID
 
     @pytest.mark.slow
     def test_train_job_completes(self, train_job):
@@ -60,22 +65,45 @@ class TestTrainingJobLifecycle:
     @pytest.mark.slow
     def test_train_job_has_s3_uri(self, train_job):
         uri = train_job["s3_uri"]
-        assert uri == "s3://ml-provenance/models/bert-imdb/model.pt"
+        assert uri == model_uri()
 
     @pytest.mark.timeout(10)
     def test_unknown_job_id_returns_404(self):
         r = requests.get(f"{FINETUNE_URL}/jobs/doesnotexist", timeout=5)
         assert r.status_code == 404
 
+    @pytest.mark.timeout(10)
+    def test_unknown_job_id_cancel_returns_404(self):
+        r = requests.post(f"{FINETUNE_URL}/jobs/doesnotexist/cancel", timeout=5)
+        assert r.status_code == 404
+
+    @pytest.mark.slow
+    def test_train_job_can_be_cancelled(self, preprocess_job):
+        r = requests.post(
+            f"{FINETUNE_URL}/train",
+            params={"split": "train", "pipeline_id": PIPELINE_ID, "epochs": 1},
+            timeout=10,
+        )
+        assert r.status_code == 200
+        job_id = r.json()["job_id"]
+
+        cancel = requests.post(f"{FINETUNE_URL}/jobs/{job_id}/cancel", timeout=10)
+        assert cancel.status_code == 200
+        assert cancel.json()["status"] in {"cancel_requested", "cancelled", "completed"}
+
+        final = wait_for_job(FINETUNE_URL, job_id, TRAIN_TIMEOUT)
+        assert final["status"] in {"cancelled", "completed"}
+
 
 # ── Model metadata ────────────────────────────────────────────────────────────
 class TestModelInfo:
     @pytest.mark.slow
     def test_model_info_available_after_training(self, train_job):
-        r = requests.get(f"{FINETUNE_URL}/model/info", timeout=10)
+        r = requests.get(f"{FINETUNE_URL}/model/info", params={"pipeline_id": PIPELINE_ID}, timeout=10)
         assert r.status_code == 200
         info = r.json()
         assert info.get("available") is not False    # not the "no model" response
+        assert info["pipeline_id"] == PIPELINE_ID
         assert info["bert_model"] == "bert-base-uncased"
         assert info["num_labels"] == 2
         assert "label_map" in info
@@ -86,7 +114,7 @@ class TestModelInfo:
 
     @pytest.mark.slow
     def test_model_info_label_map(self, train_job):
-        info = requests.get(f"{FINETUNE_URL}/model/info", timeout=10).json()
+        info = requests.get(f"{FINETUNE_URL}/model/info", params={"pipeline_id": PIPELINE_ID}, timeout=10).json()
         lm = info["label_map"]
         # label_map keys are strings in JSON ("0", "1")
         assert set(lm.values()) == {"negative", "positive"}
@@ -98,7 +126,7 @@ class TestPredictSchema:
     def test_predict_response_schema(self, train_job):
         r = requests.post(
             f"{FINETUNE_URL}/predict",
-            json={"text": "Great movie!"},
+            json={"text": "Great movie!", "pipeline_id": PIPELINE_ID},
             timeout=30,
         )
         assert r.status_code == 200
@@ -106,6 +134,7 @@ class TestPredictSchema:
         assert "label" in body
         assert "confidence" in body
         assert "scores" in body
+        assert body["pipeline_id"] == PIPELINE_ID
         assert body["label"] in ("positive", "negative")
         assert 0.0 <= body["confidence"] <= 1.0
         assert set(body["scores"].keys()) == {"positive", "negative"}
@@ -114,7 +143,7 @@ class TestPredictSchema:
     def test_predict_scores_sum_to_one(self, train_job):
         r = requests.post(
             f"{FINETUNE_URL}/predict",
-            json={"text": "Mediocre at best."},
+            json={"text": "Mediocre at best.", "pipeline_id": PIPELINE_ID},
             timeout=30,
         )
         scores = r.json()["scores"]
@@ -125,7 +154,7 @@ class TestPredictSchema:
     def test_predict_confidence_matches_max_score(self, train_job):
         r = requests.post(
             f"{FINETUNE_URL}/predict",
-            json={"text": "I loved this film!"},
+            json={"text": "I loved this film!", "pipeline_id": PIPELINE_ID},
             timeout=30,
         )
         body = r.json()
@@ -157,7 +186,7 @@ class TestPredictSentiment:
     @pytest.mark.slow
     @pytest.mark.parametrize("text", POSITIVE_REVIEWS)
     def test_positive_review_classified_positive(self, train_job, require_sufficient_samples, text):
-        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": text}, timeout=30)
+        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": text, "pipeline_id": PIPELINE_ID}, timeout=30)
         assert r.status_code == 200
         assert r.json()["label"] == "positive", (
             f"Expected positive for: {text!r}\nGot: {r.json()}"
@@ -166,7 +195,7 @@ class TestPredictSentiment:
     @pytest.mark.slow
     @pytest.mark.parametrize("text", NEGATIVE_REVIEWS)
     def test_negative_review_classified_negative(self, train_job, require_sufficient_samples, text):
-        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": text}, timeout=30)
+        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": text, "pipeline_id": PIPELINE_ID}, timeout=30)
         assert r.status_code == 200
         assert r.json()["label"] == "negative", (
             f"Expected negative for: {text!r}\nGot: {r.json()}"
@@ -176,7 +205,7 @@ class TestPredictSentiment:
 class TestPredictEdgeCases:
     @pytest.mark.slow
     def test_predict_single_word(self, train_job):
-        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": "great"}, timeout=30)
+        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": "great", "pipeline_id": PIPELINE_ID}, timeout=30)
         assert r.status_code == 200
         assert r.json()["label"] in ("positive", "negative")
 
@@ -184,7 +213,7 @@ class TestPredictEdgeCases:
     def test_predict_long_text_truncated(self, train_job):
         """Text longer than max_length (128 tokens) must still return a result."""
         long_text = "This film was great. " * 200   # ~4000 chars
-        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": long_text}, timeout=30)
+        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": long_text, "pipeline_id": PIPELINE_ID}, timeout=30)
         assert r.status_code == 200
         assert r.json()["label"] in ("positive", "negative")
 
@@ -192,7 +221,7 @@ class TestPredictEdgeCases:
     def test_predict_special_characters(self, train_job):
         r = requests.post(
             f"{FINETUNE_URL}/predict",
-            json={"text": "10/10 — würde es wieder sehen! ★★★★★"},
+            json={"text": "10/10 — würde es wieder sehen! ★★★★★", "pipeline_id": PIPELINE_ID},
             timeout=30,
         )
         assert r.status_code == 200
@@ -209,5 +238,5 @@ class TestPredictEdgeCases:
         If a model is already in S3 (from a prior run), it returns 200.
         Acceptable either way – we just verify it doesn't crash with 500.
         """
-        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": "test"}, timeout=30)
+        r = requests.post(f"{FINETUNE_URL}/predict", json={"text": "test", "pipeline_id": PIPELINE_ID}, timeout=30)
         assert r.status_code in (200, 503)

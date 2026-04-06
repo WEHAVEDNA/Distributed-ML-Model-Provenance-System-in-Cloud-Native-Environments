@@ -29,7 +29,6 @@ data:
 
   # HuggingFace cache (backed by the shared PVC below)
   HF_HOME: "/app/cache"
-  TRANSFORMERS_CACHE: "/app/cache"
 
   # Atlas provenance sidecar (receives C2PA manifest requests from pipeline services)
   ATLAS_SIDECAR_URL: "http://atlas-sidecar:8004"
@@ -42,7 +41,7 @@ metadata:
   namespace: ml-pipeline
 spec:
   accessModes:
-    - ReadWriteMany   # shared across preprocessing + fine-tuning pods
+    - ReadWriteOnce   # default local storage classes on minikube/kind usually support RWO, not RWX
   resources:
     requests:
       storage: 5Gi

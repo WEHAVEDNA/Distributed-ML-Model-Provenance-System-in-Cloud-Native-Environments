@@ -15,10 +15,10 @@ BU EC528 Spring 2026 · Intel Labs Atlas CLI
 ## Step 1 — Start the Stack
 
 ```bat
-docker compose up --build
+docker compose --progress plain up --build
 ```
 
-Wait until all four services are healthy. First build takes **15–20 minutes** (atlas-sidecar compiles atlas-cli from Rust source). Subsequent starts use cache and take under a minute.
+Keep that terminal open. Wait until all four services are healthy. The first build is the slowest because `atlas-sidecar` compiles `atlas-cli` from Rust source; later starts are much faster because Docker reuses the cached layers.
 
 Verify:
 ```powershell
@@ -30,16 +30,115 @@ Invoke-RestMethod http://localhost:8004/health   # atlas-sidecar
 
 Each should return `{ "status": "ok" }`.
 
+Docker Compose is the default local setup. The Kubernetes manifests are available for staged migration, but they are optional for normal development.
+
+### Optional: local Kubernetes deployment
+
+If you want to validate the cluster deployment without replacing the Docker workflow:
+
+```powershell
+# Build local images and load them into minikube or kind
+pwsh scripts/build_images.ps1 -Minikube
+# or
+pwsh scripts/build_images.ps1 -Kind -KindCluster kind
+
+# Apply the stack
+pwsh scripts/deploy_k8s.ps1
+
+# Reuse the existing localhost-based scripts by port-forwarding
+kubectl port-forward -n ml-pipeline svc/data-ingestion 8001:8001
+kubectl port-forward -n ml-pipeline svc/preprocessing 8002:8002
+kubectl port-forward -n ml-pipeline svc/fine-tuning 8003:8003
+kubectl port-forward -n ml-pipeline svc/atlas-sidecar 8004:8004
+```
+
+The Kubernetes path is intended as a migration target. Keep Compose as the baseline until you are ready to swap the operational default.
+
 ---
 
-## Step 2 — Run the Pipeline
+## Step 2 — Run the Demo
 
-Use the provided script to run all three stages in sequence:
+Open a new terminal while Compose is still running:
+
+```powershell
+python demo.py --samples 200 --pipeline-id demo-200
+python demo.py --samples 500 --train --pipeline-id demo-500
+python demo.py --samples 500 --train --pipeline-id demo-500 --predict-text "Loved it."
+python demo.py --samples 500 --train --train-epochs 3 --pipeline-id demo-500
+python demo.py --stage ingest --samples 200 --pipeline-id stage-demo
+python demo.py --stage preprocess --pipeline-id stage-demo
+python demo.py --stage train --pipeline-id stage-demo --predict-text "Loved it."
+```
+
+What the demo does:
+- waits for all four `/health` endpoints to become healthy
+- runs ingestion, preprocessing, and optionally training
+- shows the sidecar lineage and pipeline status for the chosen `pipeline_id`
+- runs a small inference smoke test when `--train` is enabled
+
+Use a fresh `pipeline_id` when you want a clean provenance chain without reusing older artifacts.
+The demo is standalone. You do not need to run the tests before running `demo.py`.
+When `--train` is enabled, the demo uses `1` epoch by default so the walkthrough finishes faster. Use `--train-epochs 3` if you want the longer full training run.
+Use `--stage pipeline` for ingestion + preprocessing only, `--stage full` for the complete pipeline, or `--stage ingest|preprocess|train` to run only one stage. `--train` remains available as a legacy alias for `--stage full`.
+If you press `Ctrl+C` while the demo is waiting on ingestion, preprocessing, or training, it now sends a cancellation request to the active service job before exiting.
+Cancellation is best-effort. A job that is already finishing may still report `completed` instead of `cancelled`.
+
+---
+
+## Step 3 — Verify Provenance Collection
+
+After a full demo run such as:
+
+```powershell
+python demo.py --samples 500 --train --pipeline-id demo-500
+```
+
+verify that provenance was collected and linked properly:
+
+```powershell
+$pipeline = "demo-500"
+
+Invoke-RestMethod "http://localhost:8004/lineage?pipeline_id=$pipeline"
+Invoke-RestMethod "http://localhost:8004/pipeline/status?pipeline_id=$pipeline"
+Invoke-RestMethod "http://localhost:8004/registry?pipeline_id=$pipeline"
+
+Invoke-RestMethod "http://localhost:8001/provenance?pipeline_id=$pipeline"
+Invoke-RestMethod "http://localhost:8002/provenance?pipeline_id=$pipeline"
+Invoke-RestMethod "http://localhost:8003/provenance?pipeline_id=$pipeline"
+
+Invoke-RestMethod "http://localhost:8003/model/info?pipeline_id=$pipeline"
+```
+
+Expected success signals:
+- `/lineage` shows `chain_complete: true`
+- `/lineage.chain` contains `data-ingestion`, `preprocessing`, and `fine-tuning`
+- each lineage entry has a manifest ID
+- `/pipeline/status` marks all stages done
+- `/registry` contains the pipeline-scoped raw, tokenized, and model artifact URIs
+- the three service `/provenance` endpoints all return manifest IDs for the same pipeline
+- `/model/info` returns the trained model metadata for that pipeline
+
+You can also export and verify a specific manifest:
+
+```powershell
+$lineage = Invoke-RestMethod "http://localhost:8004/lineage?pipeline_id=demo-500"
+$manifest = $lineage.chain[0].manifest_id
+$encoded = [uri]::EscapeDataString($manifest)
+
+Invoke-RestMethod "http://localhost:8004/export/$encoded"
+Invoke-RestMethod "http://localhost:8004/verify/$encoded"
+```
+
+---
+
+## Step 4 — Run the Pipeline Scripts
+
+If you want the stages individually or through the PowerShell wrapper, use the provided scripts:
 
 ```powershell
 scripts\run_pipeline.bat 500
 # or directly:
-pwsh scripts\pipeline.ps1 -Samples 500
+pwsh scripts\pipeline.ps1 -Samples 500 -PipelineId default
 ```
 
 Or run each stage individually:
@@ -50,17 +149,23 @@ scripts\02_preprocess.bat
 scripts\03_train.bat
 ```
 
-Training on CPU takes **5–10 minutes** for 500 samples. Wait for `Done.` before running tests.
+Training on CPU is the slowest stage. Wait for the final completed status before running inference or the `slow` tests.
 
 ---
 
-## Step 3 — Run the Tests
+## Step 5 — Run the Tests
 
 ```bat
-:: Fast tests only (no training required)
+:: Fast health/schema checks only
+pytest tests/ -v -m smoke
+
+:: All non-slow tests
 pytest tests/ -v
 
-:: Full test suite including training and sentiment accuracy
+:: Provenance chain tests after running the pipeline
+pytest tests/ -v -m wired --samples 200
+
+:: Full suite including fine-tuning and sentiment checks
 pytest tests/ -v -m slow --samples 500
 ```
 
@@ -68,11 +173,13 @@ pytest tests/ -v -m slow --samples 500
 
 | File | What it tests |
 |------|--------------|
+| `test_connection_handling.py` | transient disconnect retry, startup waits, timeout behavior |
 | `test_data_ingestion.py` | Ingestion job lifecycle, SHA-256, S3 URI, idempotency |
 | `test_preprocessing.py` | Token counts, max_length, source linkage |
 | `test_fine_tuning.py` | Loss progression, model metadata, `/predict` schema |
 | `test_pipeline_e2e.py` | Full provenance chain, SHA-256 uniqueness, sentiment accuracy |
 | `test_atlas_sidecar.py` | Direct sidecar calls, manifest collect/export/verify, wired pipeline checks |
+| `test_demo_cancellation.py` | demo interrupt behavior and remote cancellation requests |
 
 ### Sidecar test modes
 
@@ -83,16 +190,18 @@ The sidecar tests have two modes controlled by markers:
 pytest tests/test_atlas_sidecar.py -v
 
 # Wired — verifies the pipeline services auto-called the sidecar
-# Requires containers restarted with: docker compose up -d --force-recreate
-pytest tests/test_atlas_sidecar.py -v -m wired --samples 500
+# Run the pipeline first, then:
+pytest tests/test_atlas_sidecar.py -v -m wired --samples 200
 ```
 
-If wired tests fail with "not in registry": the containers were started before `ATLAS_SIDECAR_URL` was added to docker-compose.yaml. Fix: `docker compose up -d --force-recreate`, then re-run the pipeline.
+If wired tests fail with "not in registry", restart the containers with `docker compose up -d --force-recreate`, then re-run the pipeline before re-running the test.
 
 ### Notes
 
 - Sentiment accuracy tests (`test_inference_label_correct`, etc.) **auto-skip** when `--samples < 500`. This is expected — BERT needs at least 500 samples and 3 epochs to classify both classes reliably.
 - `--samples 100` runs everything except sentiment tests, in about 1–2 minutes total.
+- `split=validation` is not available unless you ingest that split first. The default demo and scripts use `train`.
+- All job-based services now expose `POST /jobs/{id}/cancel`. Tests and the demo treat `cancelled` as a terminal job state.
 
 ---
 
@@ -103,9 +212,10 @@ If wired tests fail with "not in registry": the containers were started before `
 docker compose down -v
 
 :: Rebuild and restart
-docker compose up --build
+docker compose --progress plain up --build
 
 :: Re-run pipeline and tests (new terminal)
+python demo.py --samples 200 --pipeline-id recreate-demo
 scripts\run_pipeline.bat 500
 pytest tests/ -v -m slow --samples 500
 ```
@@ -121,3 +231,4 @@ pytest tests/ -v -m slow --samples 500
 | atlas-sidecar never becomes healthy | Rust build may have timed out — retry `docker compose up --build` |
 | All predictions return `negative` | Re-run `01_ingest.bat` (shuffle fix already applied), then preprocess and train again |
 | Sentiment tests skip at `--samples 500` | Confirm you passed `--samples 500` and training completed with `status: completed` |
+| `Ctrl+C` stopped the demo but work kept running earlier | Rebuild the stack; current images propagate local demo cancellation to the running service job |

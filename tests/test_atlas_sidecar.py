@@ -24,11 +24,21 @@ Run:
 import pytest
 import requests
 
-from conftest import SIDECAR_URL, INGEST_URL, PREPROC_URL, FINETUNE_URL, wait_for_job
+from conftest import (
+    INGEST_TIMEOUT,
+    INGEST_URL,
+    PIPELINE_ID,
+    SIDECAR_URL,
+    model_uri,
+    preprocessed_data_uri,
+    raw_data_uri,
+    wait_for_job,
+)
 
-DATASET_URI = "s3://ml-provenance/raw/train_data.json"
-PREPROC_URI = "s3://ml-provenance/preprocessed/train_tokenized.json"
-MODEL_URI   = "s3://ml-provenance/models/bert-imdb/model.pt"
+DATASET_URI = raw_data_uri()
+PREPROC_URI = preprocessed_data_uri()
+MODEL_URI = model_uri()
+DIRECT_MODEL_PIPELINE_ID = "direct-model-collect"
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -68,6 +78,23 @@ def test_sidecar_signing_key_is_rsa():
 # These are the primary correctness tests for the sidecar.
 # They need the S3 artifact to exist (run ingestion first).
 
+
+@pytest.fixture
+def direct_model_artifact_uri():
+    """
+    Create a tiny isolated artifact in S3 so direct model collection does not
+    depend on running the full fine-tuning pipeline.
+    """
+    resp = requests.post(
+        f"{INGEST_URL}/ingest",
+        params={"split": "train", "num_samples": 8, "pipeline_id": DIRECT_MODEL_PIPELINE_ID},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    job_id = resp.json()["job_id"]
+    wait_for_job(INGEST_URL, job_id, INGEST_TIMEOUT)
+    return raw_data_uri(pipeline_id=DIRECT_MODEL_PIPELINE_ID)
+
 @pytest.mark.timeout(120)
 def test_direct_collect_dataset(ingest_job):
     """
@@ -75,6 +102,7 @@ def test_direct_collect_dataset(ingest_job):
     This proves the sidecar can download from S3, run atlas-cli, and return a manifest.
     """
     payload = {
+        "pipeline_id": PIPELINE_ID,
         "stage": "data-ingestion",
         "artifact_s3_uri": DATASET_URI,
         "ingredient_name": "IMDB train Dataset",
@@ -90,6 +118,7 @@ def test_direct_collect_dataset(ingest_job):
         f"Check: docker compose logs atlas-sidecar"
     )
     assert body["type"] == "dataset"
+    assert body["pipeline_id"] == PIPELINE_ID
     assert body["stage"] == "data-ingestion"
 
 
@@ -97,6 +126,7 @@ def test_direct_collect_dataset(ingest_job):
 def test_direct_collect_dataset_updates_registry(ingest_job):
     """After a direct collect call, the registry must contain the artifact URI."""
     payload = {
+        "pipeline_id": PIPELINE_ID,
         "stage": "data-ingestion",
         "artifact_s3_uri": DATASET_URI,
         "ingredient_name": "IMDB train Dataset",
@@ -105,7 +135,7 @@ def test_direct_collect_dataset_updates_registry(ingest_job):
     }
     requests.post(f"{SIDECAR_URL}/collect/dataset", json=payload, timeout=120)
 
-    registry = requests.get(f"{SIDECAR_URL}/registry", timeout=5).json()
+    registry = requests.get(f"{SIDECAR_URL}/registry", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
     assert DATASET_URI in registry, (
         f"Registry does not contain {DATASET_URI} after direct collect call.\n"
         f"Registry keys: {list(registry.keys())}"
@@ -120,6 +150,7 @@ def test_direct_collect_dataset_updates_registry(ingest_job):
 def test_direct_collect_pipeline(ingest_job, preprocess_job):
     """POST directly to /collect/pipeline and confirm a manifest_id comes back."""
     payload = {
+        "pipeline_id": PIPELINE_ID,
         "stage": "preprocessing",
         "input_s3_uris": [DATASET_URI],
         "output_s3_uri": PREPROC_URI,
@@ -133,16 +164,17 @@ def test_direct_collect_pipeline(ingest_job, preprocess_job):
     body = resp.json()
     assert body.get("manifest_id"), f"No manifest_id returned: {body}"
     assert body["type"] == "pipeline"
+    assert body["pipeline_id"] == PIPELINE_ID
     assert body["stage"] == "preprocessing"
 
 
-@pytest.mark.slow
-@pytest.mark.timeout(7200)
-def test_direct_collect_model(train_job):
-    """POST directly to /collect/model and confirm a manifest_id comes back."""
+@pytest.mark.timeout(120)
+def test_direct_collect_model(direct_model_artifact_uri):
+    """POST directly to /collect/model without requiring a full training run."""
     payload = {
+        "pipeline_id": DIRECT_MODEL_PIPELINE_ID,
         "stage": "fine-tuning",
-        "artifact_s3_uri": MODEL_URI,
+        "artifact_s3_uri": direct_model_artifact_uri,
         "ingredient_name": "BERT IMDB Sentiment Classifier",
         "author": "pytest",
         "linked_dataset_manifest_ids": [],
@@ -153,6 +185,7 @@ def test_direct_collect_model(train_job):
     body = resp.json()
     assert body.get("manifest_id"), f"No manifest_id returned: {body}"
     assert body["type"] == "model"
+    assert body["pipeline_id"] == DIRECT_MODEL_PIPELINE_ID
     assert body["stage"] == "fine-tuning"
 
 
@@ -161,9 +194,14 @@ def test_direct_collect_model(train_job):
 @pytest.mark.timeout(120)
 def test_manifest_count_increases_after_collect(ingest_job):
     """Each new collect call must add an entry to /manifests."""
-    before = requests.get(f"{SIDECAR_URL}/manifests", timeout=5).json()["count"]
+    before = requests.get(
+        f"{SIDECAR_URL}/manifests",
+        params={"pipeline_id": PIPELINE_ID},
+        timeout=5,
+    ).json()["count"]
 
     payload = {
+        "pipeline_id": PIPELINE_ID,
         "stage": "data-ingestion",
         "artifact_s3_uri": DATASET_URI,
         "ingredient_name": "Count test",
@@ -172,7 +210,11 @@ def test_manifest_count_increases_after_collect(ingest_job):
     }
     requests.post(f"{SIDECAR_URL}/collect/dataset", json=payload, timeout=120)
 
-    after = requests.get(f"{SIDECAR_URL}/manifests", timeout=5).json()["count"]
+    after = requests.get(
+        f"{SIDECAR_URL}/manifests",
+        params={"pipeline_id": PIPELINE_ID},
+        timeout=5,
+    ).json()["count"]
     assert after >= before, "Manifest count did not increase after collect"
 
 
@@ -182,6 +224,7 @@ def test_manifest_count_increases_after_collect(ingest_job):
 def test_export_manifest_returns_json(ingest_job):
     """Export a freshly collected manifest and confirm valid JSON is returned."""
     payload = {
+        "pipeline_id": PIPELINE_ID,
         "stage": "data-ingestion",
         "artifact_s3_uri": DATASET_URI,
         "ingredient_name": "Export test",
@@ -205,6 +248,7 @@ def test_export_manifest_returns_json(ingest_job):
 def test_verify_manifest_returns_valid_field(ingest_job):
     """Verify a freshly collected manifest — response must include 'valid' field."""
     payload = {
+        "pipeline_id": PIPELINE_ID,
         "stage": "data-ingestion",
         "artifact_s3_uri": DATASET_URI,
         "ingredient_name": "Verify test",
@@ -233,7 +277,7 @@ def test_wired_ingest_populated_registry(ingest_job):
     After ingestion, the pipeline service should have auto-called the sidecar.
     Fails if ATLAS_SIDECAR_URL is not set in the data-ingestion container.
     """
-    registry = requests.get(f"{SIDECAR_URL}/registry", timeout=5).json()
+    registry = requests.get(f"{SIDECAR_URL}/registry", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
     assert DATASET_URI in registry, (
         f"{DATASET_URI!r} not in registry.\n"
         f"The data-ingestion service did not call the sidecar automatically.\n"
@@ -246,7 +290,7 @@ def test_wired_ingest_populated_registry(ingest_job):
 @pytest.mark.wired
 @pytest.mark.timeout(60)
 def test_wired_preprocess_populated_registry(preprocess_job):
-    registry = requests.get(f"{SIDECAR_URL}/registry", timeout=5).json()
+    registry = requests.get(f"{SIDECAR_URL}/registry", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
     assert PREPROC_URI in registry, (
         f"{PREPROC_URI!r} not in registry after preprocessing.\n"
         f"Check ATLAS_SIDECAR_URL in the preprocessing container."
@@ -260,7 +304,7 @@ def test_wired_preprocess_populated_registry(preprocess_job):
 @pytest.mark.timeout(7200)
 def test_wired_full_chain_all_three_artifacts(train_job):
     """All three artifact URIs must be in the registry after a full pipeline run."""
-    registry = requests.get(f"{SIDECAR_URL}/registry", timeout=5).json()
+    registry = requests.get(f"{SIDECAR_URL}/registry", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
     missing = [u for u in (DATASET_URI, PREPROC_URI, MODEL_URI) if u not in registry]
     assert not missing, (
         f"Missing from registry: {missing}\n"

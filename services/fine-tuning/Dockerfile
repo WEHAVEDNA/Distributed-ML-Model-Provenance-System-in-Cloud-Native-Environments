@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir torch==2.3.0 --index-url https://download.pytorch
 COPY app.py .
 
 ENV HF_HOME=/app/cache
-ENV TRANSFORMERS_CACHE=/app/cache
 # Increase uvicorn timeout for long-running /predict calls
 ENV UVICORN_TIMEOUT_KEEP_ALIVE=120
 

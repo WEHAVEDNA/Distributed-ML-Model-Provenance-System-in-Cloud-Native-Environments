@@ -2,54 +2,103 @@
 Data Ingestion Service
 Stage 1 of the ML Provenance Pipeline
 
-Downloads the IMDB text dataset from HuggingFace and stores raw data
-to S3-compatible storage (MinIO locally, AWS S3 in cloud).
-
-API:
-  GET  /health        - liveness probe
-  POST /ingest        - download dataset and upload to S3
-  GET  /status        - check if raw data exists in S3
+Downloads the configured text dataset from HuggingFace and stores raw data
+to S3-compatible storage. Artifacts are namespaced by pipeline ID so multiple
+pipelines can reuse the same service without colliding in storage or provenance.
 """
 
-import os
+import datetime
+import hashlib
 import json
 import logging
-import hashlib
-import datetime
+import os
+import re
 from typing import Optional
 
 import urllib.request
 
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
 from datasets import load_dataset
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Data Ingestion Service",
-    description="ML Pipeline Stage 1 – Downloads IMDB dataset and stores to S3",
-    version="1.0.0",
+    description="ML Pipeline Stage 1 - Downloads a dataset split and stores it in S3",
+    version="1.1.0",
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
-S3_ENDPOINT   = os.getenv("S3_ENDPOINT_URL")          # None = real AWS
-S3_BUCKET     = os.getenv("S3_BUCKET", "ml-provenance")
-AWS_KEY       = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
-AWS_SECRET    = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
-AWS_REGION    = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-DATASET_NAME      = os.getenv("DATASET_NAME", "imdb")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL")
+S3_BUCKET = os.getenv("S3_BUCKET", "ml-provenance")
+AWS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
+AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+DATASET_NAME = os.getenv("DATASET_NAME", "imdb")
 ATLAS_SIDECAR_URL = os.getenv("ATLAS_SIDECAR_URL", "")
+PIPELINE_ROOT_PREFIX = os.getenv("PIPELINE_ROOT_PREFIX", "pipelines")
+PIPELINE_STAGE = "data-ingestion"
+PIPELINE_STAGE_ORDER = 10
+DEFAULT_PIPELINE_ID = os.getenv("PIPELINE_ID", "default")
 
-# In-memory job state
 _jobs: dict = {}
-_last_manifest_id: Optional[str] = None
+_last_manifest_ids: dict[str, str] = {}
 
 
-# ── S3 helper ─────────────────────────────────────────────────────────────────
+def _normalize_pipeline_id(pipeline_id: Optional[str]) -> str:
+    candidate = (pipeline_id or DEFAULT_PIPELINE_ID).strip().lower()
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", candidate).strip("._-")
+    if not normalized:
+        raise ValueError("pipeline_id must contain at least one alphanumeric character")
+    return normalized
+
+
+def _resolve_pipeline_id(pipeline_id: Optional[str]) -> str:
+    try:
+        return _normalize_pipeline_id(pipeline_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _pipeline_prefix(pipeline_id: str) -> str:
+    return f"{PIPELINE_ROOT_PREFIX}/{pipeline_id}"
+
+
+def _raw_data_key(pipeline_id: str, split: str) -> str:
+    return f"{_pipeline_prefix(pipeline_id)}/raw/{split}_data.json"
+
+
+def _raw_meta_key(pipeline_id: str, split: str) -> str:
+    return f"{_pipeline_prefix(pipeline_id)}/raw/{split}_meta.json"
+
+
+def _s3_uri(key: str) -> str:
+    return f"s3://{S3_BUCKET}/{key}"
+
+
+def _is_cancel_requested(job_id: str) -> bool:
+    return bool(_jobs.get(job_id, {}).get("cancel_requested"))
+
+
+def _cancel_job_state(
+    job_id: str,
+    *,
+    split: str,
+    pipeline_id: str,
+    num_samples: int,
+):
+    _jobs[job_id] = {
+        "status": "cancelled",
+        "split": split,
+        "pipeline_id": pipeline_id,
+        "num_samples": num_samples,
+        "cancel_requested": True,
+    }
+    log.info("[%s] Ingestion cancelled", job_id)
+
+
 def get_s3():
     return boto3.client(
         "s3",
@@ -60,16 +109,16 @@ def get_s3():
     )
 
 
-# ── Atlas Sidecar helper ──────────────────────────────────────────────────────
 def _notify_sidecar(endpoint: str, payload: dict) -> Optional[dict]:
-    """Fire-and-forget call to atlas-sidecar. Pipeline continues on failure."""
     if not ATLAS_SIDECAR_URL:
         return None
     url = f"{ATLAS_SIDECAR_URL}/collect/{endpoint}"
     try:
         body = json.dumps(payload).encode()
         req = urllib.request.Request(
-            url, data=body, method="POST",
+            url,
+            data=body,
+            method="POST",
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=300) as resp:
@@ -87,41 +136,71 @@ def ensure_bucket(s3_client):
         log.info("Created bucket %s", S3_BUCKET)
 
 
-# ── Background ingestion task ─────────────────────────────────────────────────
-def _do_ingest(job_id: str, split: str, num_samples: int):  # noqa: C901
-    _jobs[job_id] = {"status": "running", "split": split}
+def _do_ingest(job_id: str, split: str, num_samples: int, pipeline_id: str):  # noqa: C901
+    existing_job = _jobs.get(job_id, {})
+    if existing_job.get("cancel_requested"):
+        _cancel_job_state(job_id, split=split, pipeline_id=pipeline_id, num_samples=num_samples)
+        return
+
+    _jobs[job_id] = {
+        "status": "running",
+        "split": split,
+        "pipeline_id": pipeline_id,
+        "num_samples": num_samples,
+        "cancel_requested": existing_job.get("cancel_requested", False),
+    }
     try:
-        log.info("[%s] Loading %s dataset split=%s samples=%d", job_id, DATASET_NAME, split, num_samples)
+        log.info(
+            "[%s] Loading dataset=%s split=%s samples=%d pipeline=%s",
+            job_id,
+            DATASET_NAME,
+            split,
+            num_samples,
+            pipeline_id,
+        )
         dataset = load_dataset(DATASET_NAME, split=split)
-        # Stratified sampling: take exactly half negative (label=0) and half
-        # positive (label=1) to guarantee class balance regardless of num_samples.
+
+        if _is_cancel_requested(job_id):
+            _cancel_job_state(job_id, split=split, pipeline_id=pipeline_id, num_samples=num_samples)
+            return
+
         half = num_samples // 2
         neg = dataset.filter(lambda x: x["label"] == 0).shuffle(seed=42).select(range(half))
         pos = dataset.filter(lambda x: x["label"] == 1).shuffle(seed=42).select(range(half))
         import datasets as hf_datasets
-        dataset = hf_datasets.concatenate_datasets([neg, pos]).shuffle(seed=42)
 
+        dataset = hf_datasets.concatenate_datasets([neg, pos]).shuffle(seed=42)
         records = [{"text": item["text"], "label": item["label"]} for item in dataset]
 
-        # Compute checksum for provenance
+        if _is_cancel_requested(job_id):
+            _cancel_job_state(job_id, split=split, pipeline_id=pipeline_id, num_samples=len(records))
+            return
+
         payload = json.dumps(records, ensure_ascii=False).encode("utf-8")
         checksum = hashlib.sha256(payload).hexdigest()
 
         s3 = get_s3()
         ensure_bucket(s3)
 
-        data_key = f"raw/{split}_data.json"
-        meta_key = f"raw/{split}_meta.json"
+        data_key = _raw_data_key(pipeline_id, split)
+        meta_key = _raw_meta_key(pipeline_id, split)
+
+        if _is_cancel_requested(job_id):
+            _cancel_job_state(job_id, split=split, pipeline_id=pipeline_id, num_samples=len(records))
+            return
 
         s3.put_object(Bucket=S3_BUCKET, Key=data_key, Body=payload, ContentType="application/json")
 
         meta = {
+            "pipeline_id": pipeline_id,
+            "stage": PIPELINE_STAGE,
+            "stage_order": PIPELINE_STAGE_ORDER,
             "dataset": DATASET_NAME,
             "split": split,
             "num_samples": len(records),
             "sha256": checksum,
             "ingested_at": datetime.datetime.utcnow().isoformat() + "Z",
-            "s3_uri": f"s3://{S3_BUCKET}/{data_key}",
+            "s3_uri": _s3_uri(data_key),
         }
         s3.put_object(
             Bucket=S3_BUCKET,
@@ -133,36 +212,50 @@ def _do_ingest(job_id: str, split: str, num_samples: int):  # noqa: C901
         _jobs[job_id] = {
             "status": "completed",
             "split": split,
+            "pipeline_id": pipeline_id,
             "num_samples": len(records),
             "sha256": checksum,
-            "s3_uri": f"s3://{S3_BUCKET}/{data_key}",
+            "s3_uri": _s3_uri(data_key),
         }
-        log.info("[%s] Ingestion complete. %d samples → %s", job_id, len(records), data_key)
+        log.info("[%s] Ingestion complete. %d samples -> %s", job_id, len(records), data_key)
 
-        # ── Notify Atlas sidecar (called at completion of this pipeline step) ─
-        global _last_manifest_id
-        sidecar_resp = _notify_sidecar("dataset", {
-            "stage": "data-ingestion",
-            "artifact_s3_uri": f"s3://{S3_BUCKET}/{data_key}",
-            "ingredient_name": f"IMDB {split} Dataset",
-            "author": "data-ingestion-service",
-            "metadata": meta,
-        })
+        sidecar_resp = _notify_sidecar(
+            "dataset",
+            {
+                "pipeline_id": pipeline_id,
+                "stage": PIPELINE_STAGE,
+                "stage_order": PIPELINE_STAGE_ORDER,
+                "artifact_s3_uri": _s3_uri(data_key),
+                "ingredient_name": f"{DATASET_NAME} {split} Dataset",
+                "author": "data-ingestion-service",
+                "metadata": meta,
+            },
+        )
         if sidecar_resp:
             manifest_id = sidecar_resp.get("manifest_id")
             _jobs[job_id]["manifest_id"] = manifest_id
-            _last_manifest_id = manifest_id
+            if manifest_id:
+                _last_manifest_ids[pipeline_id] = manifest_id
             log.info("[%s] Atlas manifest: %s", job_id, manifest_id)
 
     except Exception as exc:
         log.exception("[%s] Ingestion failed", job_id)
-        _jobs[job_id] = {"status": "failed", "error": str(exc)}
+        _jobs[job_id] = {
+            "status": "failed",
+            "pipeline_id": pipeline_id,
+            "split": split,
+            "error": str(exc),
+        }
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "data-ingestion"}
+    return {
+        "status": "ok",
+        "service": "data-ingestion",
+        "default_pipeline_id": _normalize_pipeline_id(DEFAULT_PIPELINE_ID),
+        "pipeline_root_prefix": PIPELINE_ROOT_PREFIX,
+    }
 
 
 @app.post("/ingest")
@@ -170,19 +263,32 @@ def ingest(
     background_tasks: BackgroundTasks,
     split: str = "train",
     num_samples: int = 500,
+    pipeline_id: Optional[str] = None,
 ):
-    """
-    Start an asynchronous data ingestion job.
+    if num_samples < 2:
+        raise HTTPException(status_code=400, detail="num_samples must be at least 2")
 
-    - **split**: HuggingFace dataset split (`train` or `test`)
-    - **num_samples**: number of samples to ingest (default 500 for local dev)
-    """
+    resolved_pipeline_id = _resolve_pipeline_id(pipeline_id)
+
     import uuid
+
     job_id = str(uuid.uuid4())[:8]
-    background_tasks.add_task(_do_ingest, job_id, split, num_samples)
-    _jobs[job_id] = {"status": "queued", "split": split}
-    log.info("Queued ingestion job %s", job_id)
-    return {"job_id": job_id, "status": "queued", "split": split, "num_samples": num_samples}
+    background_tasks.add_task(_do_ingest, job_id, split, num_samples, resolved_pipeline_id)
+    _jobs[job_id] = {
+        "status": "queued",
+        "split": split,
+        "pipeline_id": resolved_pipeline_id,
+        "num_samples": num_samples,
+        "cancel_requested": False,
+    }
+    log.info("Queued ingestion job %s for pipeline=%s", job_id, resolved_pipeline_id)
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "split": split,
+        "num_samples": num_samples,
+        "pipeline_id": resolved_pipeline_id,
+    }
 
 
 @app.get("/jobs/{job_id}")
@@ -192,26 +298,43 @@ def job_status(job_id: str):
     return _jobs[job_id]
 
 
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = _jobs[job_id]
+    status = job.get("status")
+    if status in {"completed", "failed", "cancelled"}:
+        return job
+
+    updated_job = {**job, "status": "cancel_requested", "cancel_requested": True}
+    _jobs[job_id] = updated_job
+    log.info("[%s] Cancellation requested", job_id)
+    return updated_job
+
+
 @app.get("/provenance")
-def provenance():
-    """Return the most recent Atlas manifest ID registered by this service."""
+def provenance(pipeline_id: Optional[str] = None):
+    resolved_pipeline_id = _resolve_pipeline_id(pipeline_id)
     return {
         "service": "data-ingestion",
-        "manifest_id": _last_manifest_id,
+        "pipeline_id": resolved_pipeline_id,
+        "manifest_id": _last_manifest_ids.get(resolved_pipeline_id),
         "sidecar_url": ATLAS_SIDECAR_URL or None,
     }
 
 
 @app.get("/status")
-def data_status(split: str = "train"):
-    """Check whether raw data for a split already exists in S3."""
+def data_status(split: str = "train", pipeline_id: Optional[str] = None):
+    resolved_pipeline_id = _resolve_pipeline_id(pipeline_id)
     try:
         s3 = get_s3()
-        key = f"raw/{split}_meta.json"
+        key = _raw_meta_key(resolved_pipeline_id, split)
         obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
         meta = json.loads(obj["Body"].read())
-        return {"available": True, "meta": meta}
-    except ClientError as e:
-        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-            return {"available": False}
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"available": True, "pipeline_id": resolved_pipeline_id, "meta": meta}
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return {"available": False, "pipeline_id": resolved_pipeline_id}
+        raise HTTPException(status_code=500, detail=str(exc))

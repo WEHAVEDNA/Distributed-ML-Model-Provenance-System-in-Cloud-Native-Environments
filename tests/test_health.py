@@ -53,7 +53,7 @@ class TestFineTuningHealth:
         assert body["status"] == "ok"
         assert body["service"] == "fine-tuning"
         assert "device" in body
-        assert "model_loaded" in body
+        assert "loaded_pipelines" in body
 
     def test_docs_reachable(self):
         r = requests.get(f"{FINETUNE_URL}/docs", timeout=5)

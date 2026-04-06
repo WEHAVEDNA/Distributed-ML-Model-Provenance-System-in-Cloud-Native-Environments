@@ -2,7 +2,8 @@ param(
     [string]$Step     = "all",
     [int]   $Samples  = 500,
     [string]$Split    = "train",
-    [string]$Text     = ""
+    [string]$Text     = "",
+    [string]$PipelineId = "default"
 )
 
 $INGEST_URL   = "http://localhost:8001"
@@ -50,10 +51,11 @@ function Check-Health {
 }
 
 function Run-Ingest {
-    Write-Host "=== Stage 1: Data Ingestion (samples=$Samples split=$Split) ===" -ForegroundColor Cyan
-    $r = Invoke-RestMethod -Method Post "$INGEST_URL/ingest?split=$Split&num_samples=$Samples"
+    Write-Host "=== Stage 1: Data Ingestion (pipeline=$PipelineId samples=$Samples split=$Split) ===" -ForegroundColor Cyan
+    $r = Invoke-RestMethod -Method Post "$INGEST_URL/ingest?split=$Split&num_samples=$Samples&pipeline_id=$PipelineId"
     Write-Host "  Job: $($r.job_id)"
     $s = Wait-Job $INGEST_URL $r.job_id
+    Write-Host "  Pipeline: $($s.pipeline_id)"
     Write-Host "  SHA-256 : $($s.sha256)"
     Write-Host "  S3 URI  : $($s.s3_uri)"
     if ($s.manifest_id) { Write-Host "  Manifest: $($s.manifest_id)" }
@@ -61,10 +63,11 @@ function Run-Ingest {
 }
 
 function Run-Preprocess {
-    Write-Host "=== Stage 2: Preprocessing (split=$Split) ===" -ForegroundColor Cyan
-    $r = Invoke-RestMethod -Method Post "$PREPROC_URL/preprocess?split=$Split"
+    Write-Host "=== Stage 2: Preprocessing (pipeline=$PipelineId split=$Split) ===" -ForegroundColor Cyan
+    $r = Invoke-RestMethod -Method Post "$PREPROC_URL/preprocess?split=$Split&pipeline_id=$PipelineId"
     Write-Host "  Job: $($r.job_id)"
     $s = Wait-Job $PREPROC_URL $r.job_id
+    Write-Host "  Pipeline: $($s.pipeline_id)"
     Write-Host "  Samples : $($s.num_samples)"
     Write-Host "  SHA-256 : $($s.sha256)"
     Write-Host "  S3 URI  : $($s.s3_uri)"
@@ -73,11 +76,12 @@ function Run-Preprocess {
 }
 
 function Run-Train {
-    Write-Host "=== Stage 3: Fine-Tuning (split=$Split) ===" -ForegroundColor Cyan
+    Write-Host "=== Stage 3: Fine-Tuning (pipeline=$PipelineId split=$Split) ===" -ForegroundColor Cyan
     Write-Host "  Polling every 10s - training is slow on CPU"
-    $r = Invoke-RestMethod -Method Post "$TRAIN_URL/train?split=$Split"
+    $r = Invoke-RestMethod -Method Post "$TRAIN_URL/train?split=$Split&pipeline_id=$PipelineId"
     Write-Host "  Job: $($r.job_id) | Device: $($r.device) | Epochs: $($r.epochs)"
     $s = Wait-Job $TRAIN_URL $r.job_id 10
+    Write-Host "  Pipeline      : $($s.pipeline_id)"
     Write-Host "  Epoch losses : $($s.epoch_losses -join ' -> ')"
     Write-Host "  SHA-256      : $($s.sha256)"
     Write-Host "  S3 URI       : $($s.s3_uri)"
@@ -88,8 +92,9 @@ function Run-Train {
 function Run-Predict {
     $input = if ($Text) { $Text } else { "This was an absolutely brilliant piece of cinema!" }
     Write-Host "=== Inference ===" -ForegroundColor Cyan
+    Write-Host "  Pipeline: $PipelineId"
     Write-Host "  Text: $input"
-    $body = @{ text = $input } | ConvertTo-Json
+    $body = @{ text = $input; pipeline_id = $PipelineId } | ConvertTo-Json
     $r = Invoke-RestMethod -Method Post "$TRAIN_URL/predict" -ContentType "application/json" -Body $body
     Write-Host "  Label      : $($r.label)" -ForegroundColor Yellow
     Write-Host "  Confidence : $($r.confidence)"
@@ -99,8 +104,8 @@ function Run-Predict {
 }
 
 function Run-Provenance {
-    Write-Host "=== Provenance Registry ===" -ForegroundColor Cyan
-    $reg = Invoke-RestMethod "$SIDECAR_URL/registry"
+    Write-Host "=== Provenance Registry (pipeline=$PipelineId) ===" -ForegroundColor Cyan
+    $reg = Invoke-RestMethod "$SIDECAR_URL/registry?pipeline_id=$PipelineId"
     $keys = $reg.PSObject.Properties.Name
     if ($keys.Count -eq 0) {
         Write-Host "  (empty - run the pipeline first)"
@@ -135,7 +140,7 @@ switch ($Step.ToLower()) {
         Write-Host "  MinIO console : http://localhost:9001"
     }
     default {
-        Write-Host "Usage: .\pipeline.ps1 [-Step <step>] [-Samples 500] [-Split train] [-Text 'your text']"
+        Write-Host "Usage: .\pipeline.ps1 [-Step <step>] [-Samples 500] [-Split train] [-PipelineId default] [-Text 'your text']"
         Write-Host "Steps: all | health | ingest | preprocess | train | predict | provenance"
     }
 }
