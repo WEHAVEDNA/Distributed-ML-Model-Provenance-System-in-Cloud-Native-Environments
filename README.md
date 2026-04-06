@@ -1,7 +1,14 @@
 # Distributed ML Model Provenance System in Cloud-Native Environments
 
-**BU EC528 Spring 2026 — Intel Labs Capstone Project**
+**BU EC528 Spring 2026**
 Mentors: Marcela Melara, Marcin Spoczynski (Intel Labs)
+Extending [Atlas CLI](https://github.com/IntelLabs/atlas-cli) into a cloud-native distributed provenance system.
+
+Demo 1 presentation: https://docs.google.com/presentation/d/1z5usLUe9r3ex-ovyxyOwZE1G7A_tVfEOVQuWLKoFlhg/edit?usp=sharing
+
+Demo 2 presentation: https://docs.google.com/presentation/d/1WfeDlM877Tw3Msrw_t-0FO3Swb3vk92SMZvVm914wR0/edit?usp=sharing
+
+Demo 2 video: https://drive.google.com/file/d/1iPYX0nW1rNNxc22FYdzfefnvu_PNE1oM/view?usp=sharing
 
 ---
 
