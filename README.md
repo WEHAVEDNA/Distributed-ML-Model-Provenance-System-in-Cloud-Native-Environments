@@ -2,6 +2,7 @@
 
 **BU EC528 Spring 2026**
 Mentors: Marcela Melara, Marcin Spoczynski (Intel Labs)
+
 Extending [Atlas CLI](https://github.com/IntelLabs/atlas-cli) into a cloud-native distributed provenance system.
 
 Demo 1 presentation: https://docs.google.com/presentation/d/1z5usLUe9r3ex-ovyxyOwZE1G7A_tVfEOVQuWLKoFlhg/edit?usp=sharing
