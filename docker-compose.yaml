@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Local development stack – no Kubernetes required.
 # All services share the ml-pipeline network and MinIO as S3 storage.
 #

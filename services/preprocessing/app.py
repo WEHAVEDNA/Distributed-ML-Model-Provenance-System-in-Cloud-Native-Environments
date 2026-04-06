@@ -17,6 +17,7 @@ import logging
 import hashlib
 import datetime
 import uuid
+from typing import Optional
 
 import urllib.request
 
@@ -46,6 +47,7 @@ BERT_MODEL        = os.getenv("BERT_MODEL", "bert-base-uncased")
 ATLAS_SIDECAR_URL = os.getenv("ATLAS_SIDECAR_URL", "")
 
 _jobs: dict = {}
+_last_manifest_id: Optional[str] = None
 
 
 # ── Atlas Sidecar helper ──────────────────────────────────────────────────────
@@ -158,7 +160,8 @@ def _do_preprocess(job_id: str, split: str):
         log.info("[%s] Preprocessing complete. %d samples → %s", job_id, len(labels), data_key)
 
         # ── Notify Atlas sidecar with pipeline-step provenance ─────────────────
-        sidecar_resp = _notify_sidecar("pipeline", {
+        global _last_manifest_id
+        _notify_sidecar("pipeline", {
             "stage": "preprocessing",
             "input_s3_uris": [f"s3://{S3_BUCKET}/{raw_key}"],
             "output_s3_uri": f"s3://{S3_BUCKET}/{data_key}",
@@ -170,9 +173,21 @@ def _do_preprocess(job_id: str, split: str):
             ),
             "metadata": meta,
         })
-        if sidecar_resp:
-            _jobs[job_id]["manifest_id"] = sidecar_resp.get("manifest_id")
-            log.info("[%s] Atlas manifest: %s", job_id, sidecar_resp.get("manifest_id"))
+
+        # Also register the tokenized output as a dataset artifact to get a
+        # proper C2PA URN (pipeline generate-provenance uses integer IDs).
+        dataset_resp = _notify_sidecar("dataset", {
+            "stage": "preprocessing",
+            "artifact_s3_uri": f"s3://{S3_BUCKET}/{data_key}",
+            "ingredient_name": f"IMDB {split} Tokenized",
+            "author": "preprocessing-service",
+            "metadata": meta,
+        })
+        if dataset_resp:
+            manifest_id = dataset_resp.get("manifest_id")
+            _jobs[job_id]["manifest_id"] = manifest_id
+            _last_manifest_id = manifest_id
+            log.info("[%s] Atlas manifest: %s", job_id, manifest_id)
 
     except Exception as exc:
         log.exception("[%s] Preprocessing failed", job_id)
@@ -204,6 +219,16 @@ def job_status(job_id: str):
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return _jobs[job_id]
+
+
+@app.get("/provenance")
+def provenance():
+    """Return the most recent Atlas manifest ID registered by this service."""
+    return {
+        "service": "preprocessing",
+        "manifest_id": _last_manifest_id,
+        "sidecar_url": ATLAS_SIDECAR_URL or None,
+    }
 
 
 @app.get("/status")

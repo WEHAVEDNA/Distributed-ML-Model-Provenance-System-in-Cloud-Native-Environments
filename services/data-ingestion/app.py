@@ -46,6 +46,7 @@ ATLAS_SIDECAR_URL = os.getenv("ATLAS_SIDECAR_URL", "")
 
 # In-memory job state
 _jobs: dict = {}
+_last_manifest_id: Optional[str] = None
 
 
 # ── S3 helper ─────────────────────────────────────────────────────────────────
@@ -87,7 +88,7 @@ def ensure_bucket(s3_client):
 
 
 # ── Background ingestion task ─────────────────────────────────────────────────
-def _do_ingest(job_id: str, split: str, num_samples: int):
+def _do_ingest(job_id: str, split: str, num_samples: int):  # noqa: C901
     _jobs[job_id] = {"status": "running", "split": split}
     try:
         log.info("[%s] Loading %s dataset split=%s samples=%d", job_id, DATASET_NAME, split, num_samples)
@@ -139,6 +140,7 @@ def _do_ingest(job_id: str, split: str, num_samples: int):
         log.info("[%s] Ingestion complete. %d samples → %s", job_id, len(records), data_key)
 
         # ── Notify Atlas sidecar (called at completion of this pipeline step) ─
+        global _last_manifest_id
         sidecar_resp = _notify_sidecar("dataset", {
             "stage": "data-ingestion",
             "artifact_s3_uri": f"s3://{S3_BUCKET}/{data_key}",
@@ -147,8 +149,10 @@ def _do_ingest(job_id: str, split: str, num_samples: int):
             "metadata": meta,
         })
         if sidecar_resp:
-            _jobs[job_id]["manifest_id"] = sidecar_resp.get("manifest_id")
-            log.info("[%s] Atlas manifest: %s", job_id, sidecar_resp.get("manifest_id"))
+            manifest_id = sidecar_resp.get("manifest_id")
+            _jobs[job_id]["manifest_id"] = manifest_id
+            _last_manifest_id = manifest_id
+            log.info("[%s] Atlas manifest: %s", job_id, manifest_id)
 
     except Exception as exc:
         log.exception("[%s] Ingestion failed", job_id)
@@ -186,6 +190,16 @@ def job_status(job_id: str):
     if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return _jobs[job_id]
+
+
+@app.get("/provenance")
+def provenance():
+    """Return the most recent Atlas manifest ID registered by this service."""
+    return {
+        "service": "data-ingestion",
+        "manifest_id": _last_manifest_id,
+        "sidecar_url": ATLAS_SIDECAR_URL or None,
+    }
 
 
 @app.get("/status")

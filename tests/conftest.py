@@ -98,10 +98,11 @@ def pytest_addoption(parser):
 
 
 # ── Minimum-sample guard ───────────────────────────────────────────────────────
-# BERT needs at least ~200 samples to generalise well enough for sentiment tests.
-# Tests that require this fixture will be skipped automatically when --samples
-# is below the threshold, rather than failing with wrong predictions.
-MIN_SAMPLES_FOR_SENTIMENT = 500
+# BERT needs at least ~200 balanced samples to generalise well enough for
+# sentiment tests (100 positive + 100 negative).  Tests that use this fixture
+# are skipped automatically when the sample count is below threshold instead of
+# failing with wrong/random predictions.
+MIN_SAMPLES_FOR_SENTIMENT = 200
 
 @pytest.fixture(scope="session")
 def require_sufficient_samples(request):

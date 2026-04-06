@@ -63,16 +63,17 @@ META_KEY          = "models/bert-imdb/meta.json"
 ATLAS_SIDECAR_URL = os.getenv("ATLAS_SIDECAR_URL", "")
 
 # In-memory state
-_jobs:      dict = {}
-_model:     Optional[BertForSequenceClassification] = None
-_tokenizer: Optional[BertTokenizer] = None
-_device:    torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_jobs:               dict = {}
+_model:              Optional[BertForSequenceClassification] = None
+_tokenizer:          Optional[BertTokenizer] = None
+_device:             torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_last_manifest_id:   Optional[str] = None
 
 LABEL_MAP = {0: "negative", 1: "positive"}
 
 
 # ── Atlas Sidecar helper ──────────────────────────────────────────────────────
-def _notify_sidecar(endpoint: str, payload: dict):
+def _notify_sidecar(endpoint: str, payload: dict, timeout: int = 300):
     if not ATLAS_SIDECAR_URL:
         return None
     url = f"{ATLAS_SIDECAR_URL}/collect/{endpoint}"
@@ -82,7 +83,7 @@ def _notify_sidecar(endpoint: str, payload: dict):
             url, data=body, method="POST",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except Exception as exc:
         log.warning("Atlas sidecar notification failed (%s): %s", url, exc)
@@ -245,6 +246,7 @@ def _do_train(job_id: str, split: str):
             except Exception as exc:
                 log.warning("Could not fetch sidecar registry: %s", exc)
 
+        global _last_manifest_id
         sidecar_resp = _notify_sidecar("model", {
             "stage": "fine-tuning",
             "artifact_s3_uri": f"s3://{S3_BUCKET}/{MODEL_KEY}",
@@ -252,10 +254,12 @@ def _do_train(job_id: str, split: str):
             "author": "fine-tuning-service",
             "linked_dataset_manifest_ids": dataset_manifest_ids,
             "metadata": meta,
-        })
+        }, timeout=660)
         if sidecar_resp:
-            _jobs[job_id]["manifest_id"] = sidecar_resp.get("manifest_id")
-            log.info("[%s] Atlas manifest: %s", job_id, sidecar_resp.get("manifest_id"))
+            manifest_id = sidecar_resp.get("manifest_id")
+            _jobs[job_id]["manifest_id"] = manifest_id
+            _last_manifest_id = manifest_id
+            log.info("[%s] Atlas manifest: %s", job_id, manifest_id)
 
     except Exception as exc:
         log.exception("[%s] Training failed", job_id)
@@ -293,6 +297,16 @@ def health():
         "service":      "fine-tuning",
         "device":       str(_device),
         "model_loaded": _model is not None,
+    }
+
+
+@app.get("/provenance")
+def provenance():
+    """Return the most recent Atlas manifest ID registered by this service."""
+    return {
+        "service": "fine-tuning",
+        "manifest_id": _last_manifest_id,
+        "sidecar_url": ATLAS_SIDECAR_URL or None,
     }
 
 

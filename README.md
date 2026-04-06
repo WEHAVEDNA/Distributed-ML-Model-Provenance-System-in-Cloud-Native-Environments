@@ -99,11 +99,14 @@ All services are FastAPI with async background jobs. Storage is MinIO (local) or
 # 1. Start all services (first build ~15 min — compiles atlas-cli from Rust source)
 docker compose up --build
 
-# 2. Run the full pipeline (new terminal)
-scripts\run_pipeline.bat 500
+# 2. Run the demo (new terminal)
+python demo.py --samples 200           # ingest + preprocess + show provenance chain
+python demo.py --samples 500 --train   # full pipeline including fine-tuning (slow)
 
 # 3. Run tests
-pytest tests/ -v -m slow --samples 500
+pytest tests/ -v -m smoke             # fast schema/health checks only
+pytest tests/ -v -m "wired" --samples 200   # provenance chain after pipeline
+pytest tests/ -v -m slow --samples 500      # full suite including fine-tuning
 ```
 
 See [SETUP.md](SETUP.md) for step-by-step recreation instructions.
@@ -131,14 +134,26 @@ See [SETUP.md](SETUP.md) for step-by-step recreation instructions.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `:8004/health` | Liveness + atlas-cli version + key status |
+| GET | `:8004/health` | Liveness + cached atlas-cli version + key status |
 | POST | `:8004/collect/dataset` | Register dataset artifact, create C2PA manifest |
 | POST | `:8004/collect/pipeline` | Register pipeline-step SLSA provenance |
 | POST | `:8004/collect/model` | Register model artifact, link to dataset manifests |
+| GET | `:8004/lineage` | Ordered provenance chain: raw data → tokenized → model |
+| GET | `:8004/pipeline/status` | Per-stage manifest counts and completion flags |
 | GET | `:8004/registry` | All tracked artifacts: `s3_uri → {manifest_id, stage, type}` |
 | GET | `:8004/export/{manifest_id}` | Export full provenance graph as JSON |
 | GET | `:8004/verify/{manifest_id}` | Verify manifest cryptographic integrity |
 | GET | `:8004/signing-key` | RSA public key PEM |
+
+### Per-service provenance
+
+Each pipeline service exposes `GET /provenance` returning the manifest ID of the last artifact it registered:
+
+| Service | Endpoint |
+|---------|----------|
+| data-ingestion | `:8001/provenance` |
+| preprocessing | `:8002/provenance` |
+| fine-tuning | `:8003/provenance` |
 
 Interactive docs: `http://localhost:800{1,2,3,4}/docs`
 
@@ -147,18 +162,23 @@ Interactive docs: `http://localhost:800{1,2,3,4}/docs`
 ## Tests
 
 ```powershell
-pytest tests/ -v                        # fast tests (no training)
-pytest tests/ -v -m slow --samples 500  # full suite including sentiment + provenance chain
-pytest tests/test_atlas_sidecar.py -v   # sidecar direct tests
+pytest tests/ -v -m smoke                       # fast health + schema checks only
+pytest tests/ -v                                # all non-slow tests
+pytest tests/ -v -m "wired" --samples 200       # provenance chain after pipeline run
+pytest tests/ -v -m slow --samples 500          # full suite including fine-tuning
+pytest tests/test_atlas_sidecar.py -v           # sidecar direct collect tests
+pytest tests/test_provenance_chain.py -v        # lineage/pipeline-status tests
 ```
 
 | File | What it covers |
 |------|---------------|
+| `test_health.py` | All services reachable, /docs reachable |
 | `test_data_ingestion.py` | Job lifecycle, SHA-256, S3 URI, idempotency |
 | `test_preprocessing.py` | Token counts, max_length, source linkage |
 | `test_fine_tuning.py` | Loss progression, model metadata, predict schema, sentiment accuracy |
 | `test_pipeline_e2e.py` | Full provenance chain, SHA-256 uniqueness, end-to-end sentiment |
 | `test_atlas_sidecar.py` | Direct collect calls, registry updates, manifest export/verify |
+| `test_provenance_chain.py` | /lineage and /pipeline/status schema + wired chain correctness |
 
 ---
 

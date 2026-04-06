@@ -19,10 +19,13 @@ API:
   POST /collect/pipeline  - register pipeline-step provenance (Stage 2)
   POST /collect/model     - register trained model (Stage 3)
   POST /link              - link two existing manifests
+  GET  /lineage           - ordered provenance chain across all stages
+  GET  /pipeline/status   - which stages have completed manifests
   GET  /manifests         - list all collected manifests
   GET  /export/{id}       - export full provenance graph as JSON
   GET  /verify/{id}       - verify manifest integrity
   GET  /signing-key       - return the public key PEM
+  GET  /registry          - full s3_uri → manifest_id map
   GET  /health            - liveness probe
 """
 
@@ -60,9 +63,15 @@ MANIFESTS_DIR = Path(os.getenv("MANIFESTS_DIR", "/manifests/atlas"))
 KEY_PATH      = MANIFESTS_DIR / "signing-key.pem"
 AUTHOR        = os.getenv("ATLAS_AUTHOR", "ml-pipeline")
 
+# Pipeline stage order — used to build the provenance chain
+PIPELINE_STAGES = ["data-ingestion", "preprocessing", "fine-tuning"]
+
 # In-memory manifest registry (s3_uri → manifest record)
 _registry: dict = {}
 _lock = threading.Lock()
+
+# Cached atlas-cli version string (set at startup, avoids subprocess on every health check)
+_atlas_cli_version: Optional[str] = None
 
 
 # ── S3 helper ─────────────────────────────────────────────────────────────────
@@ -80,7 +89,7 @@ def get_s3():
 def _atlas_flags() -> list[str]:
     """Storage + signing flags for dataset/model subcommands."""
     return [
-        "--storage-type=local",
+        "--storage-type=local-fs",
         f"--storage-url={MANIFESTS_DIR}",
         f"--key={KEY_PATH}",
     ]
@@ -176,6 +185,7 @@ def _load_registry():
 # ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def on_startup():
+    global _atlas_cli_version
     MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Generate RSA-4096 signing key if not present
@@ -191,11 +201,13 @@ async def on_startup():
             KEY_PATH.chmod(0o600)
             log.info("Signing key ready")
 
-    # Verify atlas-cli binary
+    # Verify atlas-cli binary and cache the version string
     stdout, stderr, rc = _run_atlas("--version")
     if rc == 0:
-        log.info("atlas-cli ready: %s", stdout.strip())
+        _atlas_cli_version = stdout.strip()
+        log.info("atlas-cli ready: %s", _atlas_cli_version)
     else:
+        _atlas_cli_version = None
         log.error("atlas-cli not available: %s", stderr)
 
     _load_registry()
@@ -238,11 +250,10 @@ class LinkRequest(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    stdout, _, rc = _run_atlas("--version")
     return {
         "status": "ok",
         "service": "atlas-sidecar",
-        "atlas_cli": stdout.strip() if rc == 0 else "unavailable",
+        "atlas_cli": _atlas_cli_version if _atlas_cli_version is not None else "unavailable",
         "key_exists": KEY_PATH.exists(),
         "manifests_dir": str(MANIFESTS_DIR),
         "registered_artifacts": len(_registry),
@@ -290,9 +301,9 @@ def collect_dataset(req: DatasetCollectRequest):
         # Link to upstream manifests if provided
         for linked_id in req.linked_manifest_ids:
             _run_atlas("manifest", "link",
-                       f"--source-id={manifest_id}",
-                       f"--target-id={linked_id}",
-                       "--storage-type=filesystem",
+                       f"--source={manifest_id}",
+                       f"--target={linked_id}",
+                       "--storage-type=local-fs",
                        f"--storage-url={MANIFESTS_DIR}")
 
         _register(req.artifact_s3_uri, manifest_id, req.stage, "dataset", req.ingredient_name)
@@ -383,6 +394,7 @@ def collect_model(req: ModelCollectRequest):
             f"--ingredient-names={req.ingredient_name}",
             f"--author-org={req.author}",
             *_atlas_flags(),
+            timeout=600,
         )
 
         manifest_id = _parse_manifest_id(stdout + stderr) or _latest_manifest_id_from_index()
@@ -395,7 +407,7 @@ def collect_model(req: ModelCollectRequest):
                 "model", "link-dataset",
                 f"--model-id={manifest_id}",
                 f"--dataset-id={ds_id}",
-                "--storage-type=filesystem",
+                "--storage-type=local-fs",
                 f"--storage-url={MANIFESTS_DIR}",
             )
             if lrc != 0:
@@ -421,14 +433,76 @@ def link_manifests(req: LinkRequest):
     """Explicitly link two existing manifests (source → target)."""
     stdout, stderr, rc = _run_atlas(
         "manifest", "link",
-        f"--source-id={req.source_manifest_id}",
-        f"--target-id={req.target_manifest_id}",
-        "--storage-type=filesystem",
+        f"--source={req.source_manifest_id}",
+        f"--target={req.target_manifest_id}",
+        "--storage-type=local-fs",
         f"--storage-url={MANIFESTS_DIR}",
     )
     if rc != 0:
         raise HTTPException(500, f"manifest link failed: {stderr.strip()}")
     return {"linked": True, "source": req.source_manifest_id, "target": req.target_manifest_id}
+
+
+@app.get("/lineage")
+def lineage():
+    """
+    Return the ordered provenance chain across all pipeline stages.
+
+    The chain lists each stage's artifact URI and manifest ID in pipeline order:
+      data-ingestion → preprocessing → fine-tuning
+
+    Use this to verify the complete provenance trail from raw data to trained model.
+    """
+    with _lock:
+        entries = list(_registry.items())
+
+    chain = []
+    for stage in PIPELINE_STAGES:
+        stage_entries = [(uri, rec) for uri, rec in entries if rec.get("stage") == stage]
+        for uri, rec in stage_entries:
+            chain.append({
+                "stage": stage,
+                "artifact_uri": uri,
+                "manifest_id": rec["manifest_id"],
+                "type": rec["type"],
+                "ingredient_name": rec.get("ingredient_name"),
+            })
+
+    stages_with_manifests = [
+        s for s in PIPELINE_STAGES
+        if any(rec.get("stage") == s for _, rec in entries)
+    ]
+
+    return {
+        "chain": chain,
+        "stages_complete": stages_with_manifests,
+        "chain_complete": len(stages_with_manifests) == len(PIPELINE_STAGES),
+        "total_manifests": len(entries),
+    }
+
+
+@app.get("/pipeline/status")
+def pipeline_status():
+    """
+    Per-stage summary: how many manifests each stage has registered.
+    Useful for checking which stages have run provenance collection.
+    """
+    with _lock:
+        entries = list(_registry.items())
+
+    stages = {}
+    for stage in PIPELINE_STAGES:
+        stage_recs = [rec for _, rec in entries if rec.get("stage") == stage]
+        stages[stage] = {
+            "done": len(stage_recs) > 0,
+            "artifact_count": len(stage_recs),
+            "manifest_ids": [r["manifest_id"] for r in stage_recs if r.get("manifest_id")],
+        }
+
+    return {
+        "stages": stages,
+        "chain_complete": all(v["done"] for v in stages.values()),
+    }
 
 
 @app.get("/manifests")
@@ -453,9 +527,9 @@ def export_manifest(manifest_id: str, depth: int = 5):
     stdout, stderr, rc = _run_atlas(
         "manifest", "export",
         f"--id={manifest_id}",
-        f"--depth={depth}",
-        "--output-format=json",
-        "--storage-type=filesystem",
+        f"--max-depth={depth}",
+        "--encoding=json",
+        "--storage-type=local-fs",
         f"--storage-url={MANIFESTS_DIR}",
     )
     if rc != 0:
@@ -468,10 +542,11 @@ def export_manifest(manifest_id: str, depth: int = 5):
 
 @app.get("/verify/{manifest_id:path}")
 def verify_manifest(manifest_id: str):
-    """Verify the cryptographic integrity of a manifest."""
+    """Verify the cryptographic integrity of a specific manifest."""
     stdout, stderr, rc = _run_atlas(
         "manifest", "validate",
-        "--storage-type=filesystem",
+        f"--id={manifest_id}",
+        "--storage-type=local-fs",
         f"--storage-url={MANIFESTS_DIR}",
     )
     return {
