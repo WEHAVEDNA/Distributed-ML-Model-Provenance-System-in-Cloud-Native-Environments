@@ -39,7 +39,7 @@ spec:
       containers:
         - name: fine-tuning
           image: ml-provenance/fine-tuning:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           ports:
             - containerPort: 8003
           envFrom:
@@ -56,6 +56,18 @@ spec:
                 secretKeyRef:
                   name: minio-secret
                   key: secret-key
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
             - name: hf-cache
               mountPath: /app/cache

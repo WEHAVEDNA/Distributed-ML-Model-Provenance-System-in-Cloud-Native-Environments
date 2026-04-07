@@ -47,6 +47,13 @@ DEFAULT_PIPELINE_STAGES = [
     ).split(",")
     if stage.strip()
 ]
+DEPLOYMENT_MODE = os.getenv(
+    "DEPLOYMENT_MODE",
+    "kubernetes" if os.getenv("KUBERNETES_SERVICE_HOST") else "local",
+)
+POD_NAME = os.getenv("POD_NAME")
+POD_NAMESPACE = os.getenv("POD_NAMESPACE")
+NODE_NAME = os.getenv("NODE_NAME")
 
 _registry: dict = {}
 _lock = threading.Lock()
@@ -104,6 +111,26 @@ def _run_atlas(*args: str, timeout: int = 120) -> tuple[str, str, int]:
     return result.stdout, result.stderr, result.returncode
 
 
+def _is_resolvable_manifest_id(value: Optional[str]) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    candidate = value.strip()
+    if not candidate or candidate.isdigit():
+        return False
+
+    if candidate.lower().startswith("urn:c2pa:"):
+        return True
+
+    return bool(
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            candidate,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _parse_manifest_id(text: str) -> Optional[str]:
     urn_match = re.search(r"urn:c2pa:[0-9a-f-]{36}(?::[^\s\"']+)?", text, re.IGNORECASE)
     if urn_match:
@@ -117,14 +144,11 @@ def _parse_manifest_id(text: str) -> Optional[str]:
     if uuid_match:
         return uuid_match.group(0)
 
-    integer_match = re.search(r"\bID:\s*(\d+)", text, re.IGNORECASE)
-    if integer_match:
-        return integer_match.group(1)
-
     return None
 
 
-def _latest_manifest_id_from_index() -> Optional[str]:
+def _manifest_ids_from_index() -> list[str]:
+    manifest_ids: list[str] = []
     for name in ("manifest_index.json", "index.json"):
         index_path = MANIFESTS_DIR / name
         if not index_path.exists():
@@ -137,11 +161,32 @@ def _latest_manifest_id_from_index() -> Optional[str]:
             continue
 
         if isinstance(data, list) and data:
-            entry = data[-1]
-            return entry if isinstance(entry, str) else entry.get("id") or entry.get("manifest_id")
+            for entry in data:
+                candidate = entry if isinstance(entry, str) else entry.get("id") or entry.get("manifest_id")
+                if _is_resolvable_manifest_id(candidate):
+                    manifest_ids.append(candidate)
         if isinstance(data, dict):
-            keys = list(data.keys())
-            return keys[-1] if keys else None
+            for candidate in data.keys():
+                if _is_resolvable_manifest_id(candidate):
+                    manifest_ids.append(candidate)
+
+    return manifest_ids
+
+
+def _latest_manifest_id_from_index() -> Optional[str]:
+    manifest_ids = _manifest_ids_from_index()
+    return manifest_ids[-1] if manifest_ids else None
+
+
+def _resolve_manifest_id_from_command(text: str, previous_index_ids: list[str]) -> Optional[str]:
+    manifest_id = _parse_manifest_id(text)
+    if manifest_id:
+        return manifest_id
+
+    previous = set(previous_index_ids)
+    for candidate in reversed(_manifest_ids_from_index()):
+        if candidate not in previous:
+            return candidate
 
     return None
 
@@ -175,29 +220,64 @@ def _load_registry():
     log.info("Loaded %d manifest entries from registry", len(data))
 
 
+def _registry_key_for_record(
+    *,
+    artifact_uri: str,
+    kind: str,
+    pipeline_id: str,
+    stage: str,
+    stage_order: int,
+) -> str:
+    if kind != "pipeline":
+        return artifact_uri
+    return f"pipeline::{pipeline_id}::{stage_order:05d}::{stage}::{artifact_uri}"
+
+
+def _artifact_uri_for_record(registry_key: str, record: dict) -> str:
+    return record.get("artifact_uri") or registry_key
+
+
+def _record_tracking_id(registry_key: str, record: dict) -> str:
+    return record.get("tracking_id") or registry_key
+
+
 def _register(
     s3_uri: str,
-    manifest_id: str,
+    manifest_id: Optional[str],
     pipeline_id: str,
     stage: str,
     stage_order: int,
     kind: str,
     ingredient_name: str,
     metadata: dict,
+    input_s3_uris: Optional[list[str]] = None,
+    linked_manifest_ids: Optional[list[str]] = None,
 ):
+    registry_key = _registry_key_for_record(
+        artifact_uri=s3_uri,
+        kind=kind,
+        pipeline_id=pipeline_id,
+        stage=stage,
+        stage_order=stage_order,
+    )
     record = {
+        "tracking_id": registry_key,
+        "artifact_uri": s3_uri,
         "manifest_id": manifest_id,
         "pipeline_id": pipeline_id,
         "stage": stage,
         "stage_order": stage_order,
         "type": kind,
         "ingredient_name": ingredient_name,
+        "input_artifact_uris": list(input_s3_uris or []),
+        "linked_manifest_ids": list(linked_manifest_ids or []),
         "metadata": metadata,
         "registered_at": datetime.utcnow().isoformat() + "Z",
     }
     with _lock:
-        _registry[s3_uri] = record
+        _registry[registry_key] = record
     _persist_registry()
+    return record
 
 
 def _filtered_registry(pipeline_id: Optional[str] = None, stage: Optional[str] = None) -> dict:
@@ -293,6 +373,7 @@ class PipelineCollectRequest(BaseModel):
     stage: str
     stage_order: int = 0
     input_s3_uris: list[str] = Field(default_factory=list)
+    linked_manifest_ids: list[str] = Field(default_factory=list)
     output_s3_uri: str
     ingredient_name: str
     author: str = AUTHOR
@@ -316,6 +397,63 @@ class LinkRequest(BaseModel):
     target_manifest_id: str
 
 
+def _linked_manifest_ids_for_uris(s3_uris: list[str]) -> list[str]:
+    with _lock:
+        records = list(_registry.items())
+
+    manifest_ids: list[str] = []
+    seen: set[str] = set()
+    for uri in s3_uris:
+        for registry_key, record in records:
+            if _artifact_uri_for_record(registry_key, record) != uri:
+                continue
+            manifest_id = record.get("manifest_id")
+            if _is_resolvable_manifest_id(manifest_id) and manifest_id not in seen:
+                seen.add(manifest_id)
+                manifest_ids.append(manifest_id)
+    return manifest_ids
+
+
+def _collect_pipeline_step_manifest(
+    *,
+    output_tmp: Path,
+    ingredient_name: str,
+    author: str,
+    linked_manifest_ids: list[str],
+) -> tuple[Optional[str], str]:
+    previous_index_ids = _manifest_ids_from_index()
+    pipeline_step_name = f"{ingredient_name} pipeline step"
+    stdout, stderr, rc = _run_atlas(
+        "dataset",
+        "create",
+        f"--name={pipeline_step_name}",
+        f"--paths={output_tmp}",
+        f"--ingredient-names={pipeline_step_name}",
+        f"--author-org={author}",
+        *_atlas_flags(),
+    )
+    manifest_id = _resolve_manifest_id_from_command(stdout + stderr, previous_index_ids)
+    if rc != 0 and not manifest_id:
+        raise HTTPException(
+            status_code=500,
+            detail=f"atlas-cli pipeline step manifest failed (rc={rc}): {stderr.strip()}",
+        )
+
+    for linked_id in linked_manifest_ids:
+        if not manifest_id:
+            break
+        _run_atlas(
+            "manifest",
+            "link",
+            f"--source={manifest_id}",
+            f"--target={linked_id}",
+            "--storage-type=local-fs",
+            f"--storage-url={MANIFESTS_DIR}",
+        )
+
+    return manifest_id, stdout.strip()
+
+
 @app.get("/health")
 def health():
     with _lock:
@@ -329,6 +467,10 @@ def health():
         "registered_artifacts": len(_registry),
         "default_pipeline_id": _normalize_pipeline_id(DEFAULT_PIPELINE_ID),
         "known_pipelines": known_pipelines,
+        "deployment_mode": DEPLOYMENT_MODE,
+        "pod_name": POD_NAME,
+        "pod_namespace": POD_NAMESPACE,
+        "node_name": NODE_NAME,
     }
 
 
@@ -354,6 +496,7 @@ def collect_dataset(req: DatasetCollectRequest):
     stage_order = req.stage_order or _default_stage_order(req.stage)
     try:
         tmp_path = _download_s3_to_temp(req.artifact_s3_uri)
+        previous_index_ids = _manifest_ids_from_index()
 
         stdout, stderr, rc = _run_atlas(
             "dataset",
@@ -365,11 +508,13 @@ def collect_dataset(req: DatasetCollectRequest):
             *_atlas_flags(),
         )
 
-        manifest_id = _parse_manifest_id(stdout + stderr) or _latest_manifest_id_from_index()
+        manifest_id = _resolve_manifest_id_from_command(stdout + stderr, previous_index_ids)
         if rc != 0 and not manifest_id:
             raise HTTPException(status_code=500, detail=f"atlas-cli dataset create failed (rc={rc}): {stderr.strip()}")
 
         for linked_id in req.linked_manifest_ids:
+            if not manifest_id:
+                break
             _run_atlas(
                 "manifest",
                 "link",
@@ -379,7 +524,7 @@ def collect_dataset(req: DatasetCollectRequest):
                 f"--storage-url={MANIFESTS_DIR}",
             )
 
-        _register(
+        record = _register(
             req.artifact_s3_uri,
             manifest_id,
             pipeline_id,
@@ -388,9 +533,11 @@ def collect_dataset(req: DatasetCollectRequest):
             "dataset",
             req.ingredient_name,
             req.metadata,
+            linked_manifest_ids=req.linked_manifest_ids,
         )
 
         return {
+            "tracking_id": record["tracking_id"],
             "manifest_id": manifest_id,
             "pipeline_id": pipeline_id,
             "stage": req.stage,
@@ -416,6 +563,7 @@ def collect_pipeline(req: PipelineCollectRequest):
         for uri in req.input_s3_uris:
             input_tmps.append(_download_s3_to_temp(uri))
         output_tmp = _download_s3_to_temp(req.output_s3_uri)
+        previous_index_ids = _manifest_ids_from_index()
 
         script_path = MANIFESTS_DIR / f"build_script_{uuid.uuid4().hex}.txt"
         script_path.write_text(req.build_script or f"Pipeline stage: {req.stage}", encoding="utf-8")
@@ -431,14 +579,28 @@ def collect_pipeline(req: PipelineCollectRequest):
             f"--key={KEY_PATH}",
         )
 
-        manifest_id = _parse_manifest_id(stdout + stderr) or _latest_manifest_id_from_index()
+        manifest_id = _resolve_manifest_id_from_command(stdout + stderr, previous_index_ids)
         if rc != 0 and not manifest_id:
             raise HTTPException(
                 status_code=500,
                 detail=f"atlas-cli pipeline generate-provenance failed (rc={rc}): {stderr.strip()}",
             )
 
-        _register(
+        linked_manifest_ids = req.linked_manifest_ids or _linked_manifest_ids_for_uris(req.input_s3_uris)
+        pipeline_step_stdout = ""
+        if not manifest_id:
+            log.info(
+                "atlas-cli pipeline generate-provenance did not return a resolvable manifest ID; "
+                "creating an explicit pipeline-step manifest instead"
+            )
+            manifest_id, pipeline_step_stdout = _collect_pipeline_step_manifest(
+                output_tmp=output_tmp,
+                ingredient_name=req.ingredient_name,
+                author=req.author,
+                linked_manifest_ids=linked_manifest_ids,
+            )
+
+        record = _register(
             req.output_s3_uri,
             manifest_id,
             pipeline_id,
@@ -447,17 +609,21 @@ def collect_pipeline(req: PipelineCollectRequest):
             "pipeline",
             req.ingredient_name,
             req.metadata,
+            input_s3_uris=req.input_s3_uris,
+            linked_manifest_ids=linked_manifest_ids,
         )
 
         return {
+            "tracking_id": record["tracking_id"],
             "manifest_id": manifest_id,
             "pipeline_id": pipeline_id,
             "stage": req.stage,
             "stage_order": stage_order,
             "type": "pipeline",
             "input_s3_uris": req.input_s3_uris,
+            "linked_manifest_ids": linked_manifest_ids,
             "output_s3_uri": req.output_s3_uri,
-            "atlas_stdout": stdout.strip(),
+            "atlas_stdout": "\n".join(part for part in (stdout.strip(), pipeline_step_stdout) if part),
         }
     finally:
         for path in input_tmps:
@@ -475,6 +641,7 @@ def collect_model(req: ModelCollectRequest):
     stage_order = req.stage_order or _default_stage_order(req.stage)
     try:
         tmp_path = _download_s3_to_temp(req.artifact_s3_uri)
+        previous_index_ids = _manifest_ids_from_index()
 
         stdout, stderr, rc = _run_atlas(
             "model",
@@ -487,11 +654,13 @@ def collect_model(req: ModelCollectRequest):
             timeout=600,
         )
 
-        manifest_id = _parse_manifest_id(stdout + stderr) or _latest_manifest_id_from_index()
+        manifest_id = _resolve_manifest_id_from_command(stdout + stderr, previous_index_ids)
         if rc != 0 and not manifest_id:
             raise HTTPException(status_code=500, detail=f"atlas-cli model create failed (rc={rc}): {stderr.strip()}")
 
         for dataset_manifest_id in req.linked_dataset_manifest_ids:
+            if not manifest_id:
+                break
             if str(dataset_manifest_id).strip().isdigit():
                 log.warning(
                     "Skipping manifest link: id %r is an integer, not a resolvable manifest URN",
@@ -515,7 +684,7 @@ def collect_model(req: ModelCollectRequest):
                     link_stderr.strip(),
                 )
 
-        _register(
+        record = _register(
             req.artifact_s3_uri,
             manifest_id,
             pipeline_id,
@@ -524,9 +693,11 @@ def collect_model(req: ModelCollectRequest):
             "model",
             req.ingredient_name,
             req.metadata,
+            linked_manifest_ids=req.linked_dataset_manifest_ids,
         )
 
         return {
+            "tracking_id": record["tracking_id"],
             "manifest_id": manifest_id,
             "pipeline_id": pipeline_id,
             "stage": req.stage,
@@ -573,10 +744,14 @@ def lineage(pipeline_id: Optional[str] = None):
             "pipeline_id": resolved_pipeline_id,
             "stage": record.get("stage"),
             "stage_order": record.get("stage_order", _default_stage_order(record.get("stage", ""))),
-            "artifact_uri": uri,
+            "artifact_uri": _artifact_uri_for_record(uri, record),
+            "tracking_id": _record_tracking_id(uri, record),
             "manifest_id": record.get("manifest_id"),
+            "has_manifest": _is_resolvable_manifest_id(record.get("manifest_id")),
             "type": record.get("type"),
             "ingredient_name": record.get("ingredient_name"),
+            "input_artifact_uris": record.get("input_artifact_uris", []),
+            "linked_manifest_ids": record.get("linked_manifest_ids", []),
         }
         for uri, record in entries
     ]
@@ -605,6 +780,8 @@ def pipeline_status(pipeline_id: Optional[str] = None):
         stages[stage] = {
             "done": len(stage_records) > 0,
             "artifact_count": len(stage_records),
+            "tracking_ids": [record.get("tracking_id") for record in stage_records],
+            "manifest_count": sum(1 for record in stage_records if _is_resolvable_manifest_id(record.get("manifest_id"))),
             "manifest_ids": [record.get("manifest_id") for record in stage_records if record.get("manifest_id")],
             "stage_order": stage_records[0].get("stage_order", _default_stage_order(stage)) if stage_records else _default_stage_order(stage),
         }
@@ -650,7 +827,16 @@ def list_manifests(pipeline_id: Optional[str] = None, stage: Optional[str] = Non
     entries = list(_filtered_registry(pipeline_id=pipeline_id, stage=stage).items())
     return {
         "count": len(entries),
-        "manifests": [{"s3_uri": uri, **record} for uri, record in entries],
+        "manifests": [
+            {
+                "registry_key": uri,
+                "tracking_id": _record_tracking_id(uri, record),
+                "s3_uri": _artifact_uri_for_record(uri, record),
+                "has_manifest": _is_resolvable_manifest_id(record.get("manifest_id")),
+                **record,
+            }
+            for uri, record in entries
+        ],
     }
 
 

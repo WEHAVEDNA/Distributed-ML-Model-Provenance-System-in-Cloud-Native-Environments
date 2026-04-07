@@ -2,6 +2,7 @@ param(
     [string]$Tag = "latest",
     [string]$Registry = "",
     [switch]$Push,
+    [switch]$DockerDesktop,
     [switch]$Minikube,
     [switch]$Kind,
     [string]$KindCluster = "kind"
@@ -21,6 +22,11 @@ function Get-ImageName([string]$Service) {
 }
 
 Write-Host "Building ML provenance service images (tag=$Tag)..." -ForegroundColor Cyan
+
+if ($DockerDesktop) {
+    Write-Host "Docker Desktop mode enabled." -ForegroundColor Yellow
+    Write-Host "Images are built into the local store used by the docker-desktop cluster." -ForegroundColor Yellow
+}
 
 foreach ($service in $Services) {
     $image = Get-ImageName $service
@@ -52,6 +58,8 @@ foreach ($service in $Services) {
 
 Write-Host ""
 Write-Host "All images built successfully." -ForegroundColor Green
-if ($Minikube -or $Kind) {
+if ($DockerDesktop) {
+    Write-Host "Next: pwsh scripts/deploy_k8s.ps1 -DockerDesktop" -ForegroundColor Green
+} elseif ($Minikube -or $Kind) {
     Write-Host "Next: kubectl apply -k k8s" -ForegroundColor Green
 }

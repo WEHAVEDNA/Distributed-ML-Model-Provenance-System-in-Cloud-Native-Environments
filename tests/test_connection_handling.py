@@ -3,6 +3,8 @@ import requests
 
 import conftest
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture(autouse=True)
 def ensure_services_ready():
@@ -21,6 +23,12 @@ class _FakeResponse:
 
     def json(self):
         return self._payload
+
+
+def _non_unit_request():
+    item = type("Item", (), {"get_closest_marker": lambda self, name: None})()
+    session = type("Session", (), {"items": [item]})()
+    return type("Request", (), {"session": session})()
 
 
 def test_request_with_transient_retry_retries_safe_get(monkeypatch):
@@ -114,7 +122,7 @@ def test_ensure_services_ready_waits_until_all_healthy(monkeypatch):
     monkeypatch.setattr(conftest.time, "sleep", lambda seconds: now.__setitem__("value", now["value"] + seconds))
     monkeypatch.setattr(conftest.time, "time", lambda: now["value"])
 
-    conftest.ensure_services_ready.__wrapped__()
+    conftest.ensure_services_ready.__wrapped__(_non_unit_request())
 
     assert calls["count"] > len(conftest.HEALTH_ENDPOINTS)
 
@@ -131,4 +139,4 @@ def test_ensure_services_ready_exits_after_timeout(monkeypatch):
     monkeypatch.setattr(conftest, "HEALTHCHECK_TIMEOUT", 3)
 
     with pytest.raises(pytest.exit.Exception):
-        conftest.ensure_services_ready.__wrapped__()
+        conftest.ensure_services_ready.__wrapped__(_non_unit_request())

@@ -134,10 +134,11 @@ def build_url(base_url: str, path: str, **params: object) -> str:
     return f"{base_url}{path}" if not encoded else f"{base_url}{path}?{encoded}"
 
 
-def wait_for_services(timeout_s: int) -> None:
+def wait_for_services(timeout_s: int) -> dict[str, dict]:
     h2("Service health")
     deadline = time.time() + timeout_s
     pending = {service.name: service for service in SERVICES}
+    service_health: dict[str, dict] = {}
 
     while pending and time.time() < deadline:
         resolved = []
@@ -150,12 +151,19 @@ def wait_for_services(timeout_s: int) -> None:
             if body.get("status") != "ok":
                 continue
 
-            ok(f"{name:20s} {body.get('status', '?')}")
+            detail_parts = [f"mode={body.get('deployment_mode', 'unknown')}"]
+            if body.get("pod_name"):
+                detail_parts.append(f"pod={body['pod_name']}")
+            if body.get("node_name"):
+                detail_parts.append(f"node={body['node_name']}")
+
+            ok(f"{name:20s} {body.get('status', '?')}   {'   '.join(detail_parts)}")
             if name == "atlas-sidecar":
                 info(
                     f"atlas-cli: {body.get('atlas_cli', 'unavailable')}   "
                     f"signing-key: {'present' if body.get('key_exists') else 'missing'}"
                 )
+            service_health[name] = body
             resolved.append(name)
 
         for name in resolved:
@@ -170,6 +178,21 @@ def wait_for_services(timeout_s: int) -> None:
             f"\nERROR: services did not become healthy within {timeout_s}s: {missing}\n"
             "Run: docker compose --progress plain up --build"
         )
+
+    deployment_modes = {
+        body.get("deployment_mode")
+        for body in service_health.values()
+        if body.get("deployment_mode")
+    }
+    if len(deployment_modes) == 1:
+        mode = next(iter(deployment_modes))
+        if mode == "kubernetes":
+            ok("Runtime backend: kubernetes")
+            info("traffic path: localhost -> kubectl port-forward -> ClusterIP services")
+        else:
+            ok(f"Runtime backend: {mode}")
+
+    return service_health
 
 
 def wait_for_job(base_url: str, job_id: str, label: str, timeout_s: int) -> dict:
@@ -299,6 +322,42 @@ def run_preprocessing(split: str, pipeline_id: str) -> dict:
     return result
 
 
+def ensure_raw_data_available(split: str, pipeline_id: str, samples: int) -> dict:
+    status = get_json(
+        build_url(INGEST_URL, "/status", split=split, pipeline_id=pipeline_id),
+        timeout=10,
+    )
+    if status.get("available"):
+        return status
+
+    raise SystemExit(
+        "\n"
+        "ERROR: preprocess-only mode requires existing raw data for "
+        f"pipeline '{pipeline_id}' split '{split}'.\n"
+        "Run one of:\n"
+        f"  python demo.py --stage ingest --samples {samples} --split {split} --pipeline-id {pipeline_id}\n"
+        f"  python demo.py --stage pipeline --samples {samples} --split {split} --pipeline-id {pipeline_id}"
+    )
+
+
+def ensure_preprocessed_data_available(split: str, pipeline_id: str, samples: int) -> dict:
+    status = get_json(
+        build_url(PREPROC_URL, "/status", split=split, pipeline_id=pipeline_id),
+        timeout=10,
+    )
+    if status.get("available"):
+        return status
+
+    raise SystemExit(
+        "\n"
+        "ERROR: train-only mode requires existing preprocessed data for "
+        f"pipeline '{pipeline_id}' split '{split}'.\n"
+        "Run one of:\n"
+        f"  python demo.py --stage pipeline --samples {samples} --split {split} --pipeline-id {pipeline_id}\n"
+        f"  python demo.py --samples {samples} --train --split {split} --pipeline-id {pipeline_id}"
+    )
+
+
 def run_training(split: str, pipeline_id: str, epochs: int) -> dict:
     h2("Stage 3 – Fine-Tuning")
     warn(f"CPU training is slow. Demo training defaults to {epochs} epoch(s).")
@@ -332,12 +391,16 @@ def show_lineage(pipeline_id: str) -> None:
         return
 
     for entry in chain:
+        manifest_text = entry.get("manifest_id") or "tracked-only"
         print(
             f"  {BOLD}{entry.get('stage', '?'):20s}{RESET} "
             f"{entry.get('type', '?'):10s} "
-            f"manifest={entry.get('manifest_id', 'none')}"
+            f"manifest={manifest_text}"
         )
         info(f"  └─ {entry.get('artifact_uri', '')}")
+        inputs = entry.get("input_artifact_uris") or []
+        if inputs:
+            info(f"     inputs: {', '.join(inputs)}")
 
     completed = ", ".join(lineage.get("stages_complete", [])) or "none"
     info(f"stages_complete: {completed}")
@@ -381,11 +444,17 @@ def prove_provenance(pipeline_id: str) -> None:
     else:
         warn("Registry is empty for this pipeline")
 
-    manifest_ids = [entry.get("manifest_id") for entry in chain if entry.get("manifest_id")]
-    if len(manifest_ids) == len(chain):
-        ok("Every lineage entry has a manifest ID")
+    tracking_ids = [entry.get("tracking_id") for entry in chain if entry.get("tracking_id")]
+    if len(tracking_ids) == len(chain):
+        ok("Every lineage entry has a sidecar tracking ID")
     else:
-        warn("One or more lineage entries are missing a manifest ID")
+        warn("One or more lineage entries are missing a sidecar tracking ID")
+
+    manifest_ids = [entry.get("manifest_id") for entry in chain if entry.get("manifest_id")]
+    if manifest_ids:
+        ok(f"{len(manifest_ids)}/{len(chain)} lineage entries have exportable manifest IDs")
+    else:
+        warn("No exportable manifest IDs were found in lineage")
 
     stages = status.get("stages", {})
     done_stages = [name for name, stage_info in stages.items() if stage_info.get("done")]
@@ -411,6 +480,14 @@ def prove_provenance(pipeline_id: str) -> None:
             ok(f"{service_name} reports manifest_id={manifest_id}")
         else:
             info(f"{service_name:20s} manifest_id=None")
+
+    if not manifest_ids:
+        warn("Skipping export/verify because no exportable manifest IDs are available")
+        if lineage.get("chain_complete"):
+            ok("Tracking complete: full pipeline history was recorded by the sidecar")
+        else:
+            warn("Tracking partial: sidecar history does not yet cover the full pipeline")
+        return
 
     manifest_id = manifest_ids[0]
     encoded_manifest_id = urllib.parse.quote(manifest_id, safe="")
@@ -538,9 +615,11 @@ def main() -> None:
         run_ingestion(args.split, args.samples, args.pipeline_id)
     elif args.stage == "preprocess":
         warn("Preprocess-only mode expects raw data for this pipeline and split to already exist.")
+        ensure_raw_data_available(args.split, args.pipeline_id, args.samples)
         run_preprocessing(args.split, args.pipeline_id)
     elif args.stage == "train":
         warn("Train-only mode expects preprocessed data for this pipeline and split to already exist.")
+        ensure_preprocessed_data_available(args.split, args.pipeline_id, args.samples)
         run_training(args.split, args.pipeline_id, args.train_epochs)
         run_inference_smoke(args.pipeline_id, args.predict_text)
     else:

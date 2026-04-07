@@ -14,13 +14,40 @@ BU EC528 Spring 2026 · Intel Labs Atlas CLI
 
 ## Step 1 — Start the Stack
 
+Choose one local runtime.
+
+### Option A — Docker Compose
+
 ```bat
 docker compose --progress plain up --build
 ```
 
 Keep that terminal open. Wait until all four services are healthy. The first build is the slowest because `atlas-sidecar` compiles `atlas-cli` from Rust source; later starts are much faster because Docker reuses the cached layers.
 
-Verify:
+### Option B — Kubernetes on Docker Desktop
+
+```bat
+scripts\setup_k8s_docker_desktop.bat
+```
+
+That batched Windows wrapper builds the images and deploys the cluster stack.
+In Docker Desktop mode it also clears the previous Kubernetes service deployments and waits for their pods to disappear first, so each startup comes up on fresh pods.
+After deployment it keeps the current terminal attached to a live Kubernetes pod-status stream instead of opening another terminal automatically.
+
+Then start the port-forwards manually in the terminal where you want them to run:
+
+```powershell
+pwsh scripts\port_forward.ps1
+```
+
+If you only want the deploy step without the live watcher:
+
+```bat
+scripts\setup_k8s_docker_desktop.bat --no-watch
+```
+
+### Verify
+
 ```powershell
 Invoke-RestMethod http://localhost:8001/health   # data-ingestion
 Invoke-RestMethod http://localhost:8002/health   # preprocessing
@@ -30,35 +57,91 @@ Invoke-RestMethod http://localhost:8004/health   # atlas-sidecar
 
 Each should return `{ "status": "ok" }`.
 
+Do not leave both local backends active on the same localhost ports at the same time. Stop Compose before using the Kubernetes port-forwards, and stop the Kubernetes port-forwards before switching back to Compose.
+
 Docker Compose is the default local setup. The Kubernetes manifests are available for staged migration, but they are optional for normal development.
 
 ### Optional: local Kubernetes deployment
 
 If you want to validate the cluster deployment without replacing the Docker workflow:
 
-```powershell
-# Build local images and load them into minikube or kind
-pwsh scripts/build_images.ps1 -Minikube
-# or
-pwsh scripts/build_images.ps1 -Kind -KindCluster kind
-
-# Apply the stack
-pwsh scripts/deploy_k8s.ps1
-
-# Reuse the existing localhost-based scripts by port-forwarding
-kubectl port-forward -n ml-pipeline svc/data-ingestion 8001:8001
-kubectl port-forward -n ml-pipeline svc/preprocessing 8002:8002
-kubectl port-forward -n ml-pipeline svc/fine-tuning 8003:8003
-kubectl port-forward -n ml-pipeline svc/atlas-sidecar 8004:8004
+```bat
+scripts\setup_k8s_docker_desktop.bat
 ```
 
+That batched Windows wrapper builds the images, deploys the cluster stack, and then streams `kubectl get pods -w` in the same terminal.
+
+```powershell
+# Enable Docker Desktop Kubernetes once, then switch context
+kubectl config use-context docker-desktop
+
+# Build local images into Docker Desktop's image store
+pwsh scripts/build_images.ps1 -DockerDesktop
+
+# Apply the stack and patch the four local service deployments
+pwsh scripts/deploy_k8s.ps1 -DockerDesktop
+
+# or do both in one step
+pwsh scripts/deploy_k8s.ps1 -BuildImages -DockerDesktop
+
+# Reuse the existing localhost-based scripts by port-forwarding
+pwsh scripts\port_forward.ps1
+```
+
+`pwsh scripts/deploy_k8s.ps1 -DockerDesktop` now enforces the `docker-desktop` context, deletes the existing local Kubernetes workloads first, waits for their old pods to terminate, applies the manifests with the four local service deployments already set to `imagePullPolicy: Never`, and waits for `minio-init` to complete. Because the deployments are created with the correct policy up front, the script no longer triggers an immediate second rollout on fresh pods.
+
+Use `scripts\stop_k8s_port_forward.bat` later to stop the port-forwards. Use `scripts\setup_k8s_docker_desktop.bat --no-watch` if you want the deployment without the live watcher.
+
+If you prefer minikube or kind, the existing `pwsh scripts/build_images.ps1 -Minikube` and `-Kind` paths still work.
+
 The Kubernetes path is intended as a migration target. Keep Compose as the baseline until you are ready to swap the operational default.
+
+### Stop and switch
+
+Stop Docker Compose:
+
+```powershell
+docker compose down
+```
+
+Stop Docker Compose and remove local volumes:
+
+```powershell
+docker compose down -v
+```
+
+Stop Kubernetes localhost port-forwards only:
+
+```bat
+scripts\stop_k8s_port_forward.bat
+```
+
+Remove the Kubernetes stack from the Docker Desktop cluster:
+
+```powershell
+kubectl delete -k k8s
+```
+
+Switch from Docker Compose to Kubernetes:
+
+```powershell
+docker compose down
+scripts\setup_k8s_docker_desktop.bat
+```
+
+Switch from Kubernetes back to Docker Compose:
+
+```powershell
+scripts\stop_k8s_port_forward.bat
+kubectl delete -k k8s
+docker compose --progress plain up --build
+```
 
 ---
 
 ## Step 2 — Run the Demo
 
-Open a new terminal while Compose is still running:
+Open a new terminal while your chosen backend is still running:
 
 ```powershell
 python demo.py --samples 200 --pipeline-id demo-200
@@ -75,6 +158,7 @@ What the demo does:
 - runs ingestion, preprocessing, and optionally training
 - shows the sidecar lineage and pipeline status for the chosen `pipeline_id`
 - runs a small inference smoke test when `--train` is enabled
+- prints the deployment mode during health checks; on Kubernetes it explicitly shows `Runtime backend: kubernetes` together with the service pod and node names
 
 Use a fresh `pipeline_id` when you want a clean provenance chain without reusing older artifacts.
 The demo is standalone. You do not need to run the tests before running `demo.py`.
@@ -112,7 +196,9 @@ Invoke-RestMethod "http://localhost:8003/model/info?pipeline_id=$pipeline"
 Expected success signals:
 - `/lineage` shows `chain_complete: true`
 - `/lineage.chain` contains `data-ingestion`, `preprocessing`, and `fine-tuning`
-- each lineage entry has a manifest ID
+- every lineage entry has a sidecar `tracking_id`
+- some pipeline-step entries may be `tracked-only` if Atlas does not return a resolvable manifest URN
+- dataset/model lineage entries have manifest IDs; pipeline-step entries may be tracked without an exportable manifest ID
 - `/pipeline/status` marks all stages done
 - `/registry` contains the pipeline-scoped raw, tokenized, and model artifact URIs
 - the three service `/provenance` endpoints all return manifest IDs for the same pipeline

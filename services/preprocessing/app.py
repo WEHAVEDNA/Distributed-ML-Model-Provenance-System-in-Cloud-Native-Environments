@@ -44,6 +44,13 @@ PIPELINE_ROOT_PREFIX = os.getenv("PIPELINE_ROOT_PREFIX", "pipelines")
 PIPELINE_STAGE = "preprocessing"
 PIPELINE_STAGE_ORDER = 20
 DEFAULT_PIPELINE_ID = os.getenv("PIPELINE_ID", "default")
+DEPLOYMENT_MODE = os.getenv(
+    "DEPLOYMENT_MODE",
+    "kubernetes" if os.getenv("KUBERNETES_SERVICE_HOST") else "local",
+)
+POD_NAME = os.getenv("POD_NAME")
+POD_NAMESPACE = os.getenv("POD_NAMESPACE")
+NODE_NAME = os.getenv("NODE_NAME")
 
 _jobs: dict = {}
 _last_manifest_ids: dict[str, str] = {}
@@ -262,7 +269,7 @@ def _do_preprocess(job_id: str, split: str, pipeline_id: str):
             ContentType="application/json",
         )
 
-        _jobs[job_id] = {
+        job_state = {
             "status": "completed",
             "split": split,
             "pipeline_id": pipeline_id,
@@ -272,9 +279,11 @@ def _do_preprocess(job_id: str, split: str, pipeline_id: str):
             "sha256": checksum,
             "s3_uri": _s3_uri(data_key),
         }
+        _jobs[job_id] = {**job_state, "status": "finalizing"}
         log.info("[%s] Preprocessing complete. %d samples -> %s", job_id, len(labels), data_key)
 
         input_uri = _s3_uri(raw_key)
+        linked_manifest_ids = _lookup_manifest_ids(pipeline_id, [input_uri])
         _notify_sidecar(
             "pipeline",
             {
@@ -282,6 +291,7 @@ def _do_preprocess(job_id: str, split: str, pipeline_id: str):
                 "stage": PIPELINE_STAGE,
                 "stage_order": PIPELINE_STAGE_ORDER,
                 "input_s3_uris": [input_uri],
+                "linked_manifest_ids": linked_manifest_ids,
                 "output_s3_uri": _s3_uri(data_key),
                 "ingredient_name": f"{pipeline_id} {split} tokenized dataset",
                 "author": "preprocessing-service",
@@ -293,7 +303,6 @@ def _do_preprocess(job_id: str, split: str, pipeline_id: str):
             },
         )
 
-        linked_manifest_ids = _lookup_manifest_ids(pipeline_id, [input_uri])
         dataset_resp = _notify_sidecar(
             "dataset",
             {
@@ -314,6 +323,8 @@ def _do_preprocess(job_id: str, split: str, pipeline_id: str):
                 _last_manifest_ids[pipeline_id] = manifest_id
             log.info("[%s] Atlas manifest: %s", job_id, manifest_id)
 
+        _jobs[job_id] = {**_jobs[job_id], **job_state}
+
     except Exception as exc:
         log.exception("[%s] Preprocessing failed", job_id)
         _jobs[job_id] = {
@@ -331,6 +342,10 @@ def health():
         "service": "preprocessing",
         "default_pipeline_id": _normalize_pipeline_id(DEFAULT_PIPELINE_ID),
         "pipeline_root_prefix": PIPELINE_ROOT_PREFIX,
+        "deployment_mode": DEPLOYMENT_MODE,
+        "pod_name": POD_NAME,
+        "pod_namespace": POD_NAMESPACE,
+        "node_name": NODE_NAME,
     }
 
 

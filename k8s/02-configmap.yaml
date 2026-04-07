@@ -1,5 +1,5 @@
-# Shared environment variables for all three ML pipeline services.
-# Services read these to locate MinIO and configure BERT hyperparameters.
+# Shared environment variables for the three ML pipeline services and the Atlas sidecar.
+# These values mirror the local Docker Compose contract.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,6 +10,10 @@ data:
   S3_ENDPOINT_URL: "http://minio:9000"
   S3_BUCKET: "ml-provenance"
   AWS_DEFAULT_REGION: "us-east-1"
+  DEPLOYMENT_MODE: "kubernetes"
+  PIPELINE_ID: "default"
+  PIPELINE_ROOT_PREFIX: "pipelines"
+  PIPELINE_STAGES: "data-ingestion,preprocessing,fine-tuning"
 
   # BERT model to use (data-ingestion doesn't need this)
   BERT_MODEL: "bert-base-uncased"
@@ -26,6 +30,8 @@ data:
   BATCH_SIZE: "16"
   LEARNING_RATE: "2e-5"
   WARMUP_RATIO: "0.1"
+  MODEL_ARTIFACT_NAME: "classifier"
+  RANDOM_SEED: "42"
 
   # HuggingFace cache (backed by the shared PVC below)
   HF_HOME: "/app/cache"

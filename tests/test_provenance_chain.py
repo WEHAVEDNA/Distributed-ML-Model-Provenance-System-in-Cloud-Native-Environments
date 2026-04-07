@@ -60,7 +60,9 @@ class TestLineageEndpointSmoke:
         for entry in chain:
             assert "stage" in entry, f"Missing 'stage' in entry: {entry}"
             assert "artifact_uri" in entry, f"Missing 'artifact_uri' in entry: {entry}"
+            assert "tracking_id" in entry, f"Missing 'tracking_id' in entry: {entry}"
             assert "manifest_id" in entry, f"Missing 'manifest_id' in entry: {entry}"
+            assert "has_manifest" in entry, f"Missing 'has_manifest' in entry: {entry}"
             assert "type" in entry, f"Missing 'type' in entry: {entry}"
 
     @pytest.mark.smoke
@@ -119,9 +121,13 @@ class TestPipelineStatusSmoke:
             entry = stages[s]
             assert "done" in entry, f"Missing 'done' for stage {s}"
             assert "artifact_count" in entry, f"Missing 'artifact_count' for stage {s}"
+            assert "tracking_ids" in entry, f"Missing 'tracking_ids' for stage {s}"
+            assert "manifest_count" in entry, f"Missing 'manifest_count' for stage {s}"
             assert "manifest_ids" in entry, f"Missing 'manifest_ids' for stage {s}"
             assert isinstance(entry["done"], bool)
             assert isinstance(entry["artifact_count"], int)
+            assert isinstance(entry["tracking_ids"], list)
+            assert isinstance(entry["manifest_count"], int)
             assert isinstance(entry["manifest_ids"], list)
 
 
@@ -259,10 +265,26 @@ class TestLineageAfterPipeline:
 
     @pytest.mark.wired
     @pytest.mark.timeout(60)
+    def test_ingest_job_completion_payload_includes_manifest_id(self, ingest_job):
+        assert ingest_job.get("manifest_id") is not None, (
+            "Completed ingestion job payload did not include manifest_id.\n"
+            "The job should not transition to completed until sidecar collection finishes."
+        )
+
+    @pytest.mark.wired
+    @pytest.mark.timeout(60)
     def test_preprocessing_service_provenance_populated(self, preprocess_job):
         body = requests.get(f"{PREPROC_URL}/provenance", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
         assert body["manifest_id"] is not None, (
             "preprocessing /provenance returned manifest_id=None after preprocess_job."
+        )
+
+    @pytest.mark.wired
+    @pytest.mark.timeout(60)
+    def test_preprocess_job_completion_payload_includes_manifest_id(self, preprocess_job):
+        assert preprocess_job.get("manifest_id") is not None, (
+            "Completed preprocessing job payload did not include manifest_id.\n"
+            "The job should not transition to completed until sidecar collection finishes."
         )
 
     @pytest.mark.wired
@@ -274,10 +296,12 @@ class TestLineageAfterPipeline:
             f"chain_complete is False after full pipeline run.\n"
             f"stages_complete: {lineage['stages_complete']}"
         )
-        # Every entry must have a non-empty manifest_id
+        assert any(entry.get("type") == "pipeline" for entry in lineage["chain"]), (
+            f"No pipeline-step record found in lineage: {lineage['chain']}"
+        )
         for entry in lineage["chain"]:
-            assert entry["manifest_id"], (
-                f"Empty manifest_id in chain entry: {entry}"
+            assert entry["tracking_id"], (
+                f"Missing tracking_id in chain entry: {entry}"
             )
 
     @pytest.mark.wired
@@ -311,12 +335,13 @@ class TestLineageAfterPipeline:
     def test_manifest_ids_are_distinct_across_stages(self, train_job):
         """Each stage must produce a different manifest ID (no accidental sharing)."""
         lineage = requests.get(f"{SIDECAR_URL}/lineage", params={"pipeline_id": PIPELINE_ID}, timeout=5).json()
-        ids = [e["manifest_id"] for e in lineage["chain"] if e.get("manifest_id")]
         # Allow same artifact collected multiple times to overwrite; just check
         # that if all three stages are present their IDs differ.
         stage_ids = {}
         for entry in lineage["chain"]:
-            stage_ids[entry["stage"]] = entry.get("manifest_id")
+            manifest_id = entry.get("manifest_id")
+            if manifest_id:
+                stage_ids[entry["stage"]] = manifest_id
         if len(stage_ids) >= 2:
             unique_ids = set(stage_ids.values()) - {None}
             assert len(unique_ids) == len([v for v in stage_ids.values() if v]), (

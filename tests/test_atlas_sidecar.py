@@ -112,6 +112,7 @@ def test_direct_collect_dataset(ingest_job):
     resp = requests.post(f"{SIDECAR_URL}/collect/dataset", json=payload, timeout=120)
     assert resp.status_code == 200, f"collect/dataset failed: {resp.text}"
     body = resp.json()
+    assert body.get("tracking_id"), f"No tracking_id in response: {body}"
     assert body.get("manifest_id"), (
         f"No manifest_id in response — atlas-cli may have failed.\n"
         f"Response: {body}\n"
@@ -148,7 +149,7 @@ def test_direct_collect_dataset_updates_registry(ingest_job):
 
 @pytest.mark.timeout(120)
 def test_direct_collect_pipeline(ingest_job, preprocess_job):
-    """POST directly to /collect/pipeline and confirm a manifest_id comes back."""
+    """POST directly to /collect/pipeline and confirm it does not return a bogus integer ID."""
     payload = {
         "pipeline_id": PIPELINE_ID,
         "stage": "preprocessing",
@@ -162,10 +163,78 @@ def test_direct_collect_pipeline(ingest_job, preprocess_job):
     resp = requests.post(f"{SIDECAR_URL}/collect/pipeline", json=payload, timeout=120)
     assert resp.status_code == 200, f"collect/pipeline failed: {resp.text}"
     body = resp.json()
-    assert body.get("manifest_id"), f"No manifest_id returned: {body}"
+    assert body.get("tracking_id"), f"No tracking_id returned: {body}"
+    manifest_id = body.get("manifest_id")
+    assert manifest_id is None or str(manifest_id).startswith("urn:c2pa:"), (
+        f"collect/pipeline returned a non-resolvable manifest_id: {body}"
+    )
     assert body["type"] == "pipeline"
     assert body["pipeline_id"] == PIPELINE_ID
     assert body["stage"] == "preprocessing"
+
+
+@pytest.mark.timeout(120)
+def test_direct_collect_pipeline_does_not_overwrite_dataset_registry(preprocess_job):
+    """
+    Pipeline provenance should be tracked separately from the output dataset record.
+    The exact S3 URI key must remain the dataset manifest entry used by downstream stages.
+    """
+    before = requests.get(
+        f"{SIDECAR_URL}/registry",
+        params={"pipeline_id": PIPELINE_ID},
+        timeout=5,
+    ).json()
+    assert PREPROC_URI in before, f"Expected preprocessed dataset in registry before pipeline collect: {before}"
+    assert before[PREPROC_URI]["type"] == "dataset"
+
+    payload = {
+        "pipeline_id": PIPELINE_ID,
+        "stage": "preprocessing",
+        "input_s3_uris": [DATASET_URI],
+        "output_s3_uri": PREPROC_URI,
+        "ingredient_name": "IMDB train Tokenized",
+        "author": "pytest",
+        "build_script": "BertTokenizer.from_pretrained('bert-base-uncased') max_length=128",
+        "metadata": {},
+    }
+    resp = requests.post(f"{SIDECAR_URL}/collect/pipeline", json=payload, timeout=120)
+    assert resp.status_code == 200, f"collect/pipeline failed: {resp.text}"
+    body = resp.json()
+
+    registry = requests.get(
+        f"{SIDECAR_URL}/registry",
+        params={"pipeline_id": PIPELINE_ID},
+        timeout=5,
+    ).json()
+    assert PREPROC_URI in registry, f"Preprocessed dataset key disappeared from registry: {registry}"
+    assert registry[PREPROC_URI]["type"] == "dataset", (
+        f"Pipeline collect overwrote the dataset registry entry: {registry[PREPROC_URI]}"
+    )
+    if body.get("manifest_id"):
+        assert body["manifest_id"] != registry[PREPROC_URI]["manifest_id"], (
+            "Pipeline collect reused the dataset manifest ID for the pipeline-step record. "
+            f"Response: {body} registry_entry: {registry[PREPROC_URI]}"
+        )
+
+    manifests = requests.get(
+        f"{SIDECAR_URL}/manifests",
+        params={"pipeline_id": PIPELINE_ID},
+        timeout=5,
+    ).json()["manifests"]
+    assert any(
+        entry.get("type") == "pipeline" and entry.get("s3_uri") == PREPROC_URI
+        for entry in manifests
+    ), "Pipeline collect was not tracked separately in /manifests"
+
+    lineage = requests.get(
+        f"{SIDECAR_URL}/lineage",
+        params={"pipeline_id": PIPELINE_ID},
+        timeout=5,
+    ).json()["chain"]
+    assert any(
+        entry.get("type") == "pipeline" and entry.get("artifact_uri") == PREPROC_URI
+        for entry in lineage
+    ), "Pipeline collect was not included in /lineage"
 
 
 @pytest.mark.timeout(120)
@@ -183,6 +252,7 @@ def test_direct_collect_model(direct_model_artifact_uri):
     resp = requests.post(f"{SIDECAR_URL}/collect/model", json=payload, timeout=120)
     assert resp.status_code == 200, f"collect/model failed: {resp.text}"
     body = resp.json()
+    assert body.get("tracking_id"), f"No tracking_id returned: {body}"
     assert body.get("manifest_id"), f"No manifest_id returned: {body}"
     assert body["type"] == "model"
     assert body["pipeline_id"] == DIRECT_MODEL_PIPELINE_ID

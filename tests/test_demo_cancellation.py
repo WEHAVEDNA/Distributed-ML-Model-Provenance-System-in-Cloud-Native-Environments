@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 
 _DEMO_PATH = Path(__file__).resolve().parents[1] / "demo.py"
 _DEMO_SPEC = importlib.util.spec_from_file_location("demo_under_test", _DEMO_PATH)
@@ -144,7 +146,9 @@ def test_prove_provenance_reports_success(monkeypatch):
                 "chain": [
                     {
                         "stage": "data-ingestion",
+                        "tracking_id": "track:data-ingestion",
                         "manifest_id": "urn:c2pa:test-manifest",
+                        "has_manifest": True,
                         "artifact_uri": "s3://ml-provenance/pipelines/demo-500/raw/train_data.json",
                     }
                 ],
@@ -186,7 +190,8 @@ def test_prove_provenance_reports_success(monkeypatch):
 
     assert not warn_calls
     assert "Registry contains 1 artifact(s) for pipeline demo-500" in ok_calls
-    assert "Every lineage entry has a manifest ID" in ok_calls
+    assert "Every lineage entry has a sidecar tracking ID" in ok_calls
+    assert "1/1 lineage entries have exportable manifest IDs" in ok_calls
     assert "Pipeline status marks these stages complete: data-ingestion, preprocessing, fine-tuning" in ok_calls
     assert "data-ingestion reports manifest_id=urn:c2pa:ingest" in ok_calls
     assert "preprocessing reports manifest_id=urn:c2pa:preprocess" in ok_calls
@@ -218,6 +223,16 @@ def test_main_routes_requested_stage(monkeypatch):
     monkeypatch.setattr(demo, "info", lambda _: None)
     monkeypatch.setattr(demo, "warn", lambda msg: calls.append(("warn", msg)))
     monkeypatch.setattr(demo, "wait_for_services", lambda timeout: calls.append(("health", timeout)))
+    monkeypatch.setattr(
+        demo,
+        "ensure_raw_data_available",
+        lambda split, pipeline_id, samples: calls.append(("ensure-raw", (split, pipeline_id, samples))),
+    )
+    monkeypatch.setattr(
+        demo,
+        "ensure_preprocessed_data_available",
+        lambda split, pipeline_id, samples: calls.append(("ensure-preprocessed", (split, pipeline_id, samples))),
+    )
     monkeypatch.setattr(demo, "run_ingestion", lambda *args: calls.append(("ingest", args)))
     monkeypatch.setattr(demo, "run_preprocessing", lambda *args: calls.append(("preprocess", args)))
     monkeypatch.setattr(demo, "run_training", lambda *args: calls.append(("train", args)))
@@ -232,9 +247,87 @@ def test_main_routes_requested_stage(monkeypatch):
     assert calls == [
         ("health", 10),
         ("warn", "Preprocess-only mode expects raw data for this pipeline and split to already exist."),
+        ("ensure-raw", ("train", "demo-200", 200)),
         ("preprocess", ("train", "demo-200")),
         ("lineage", "demo-200"),
         ("status", "demo-200"),
         ("proof", "demo-200"),
         ("summary", "demo-200"),
+    ]
+
+
+def test_ensure_raw_data_available_exits_before_backend(monkeypatch):
+    def fake_get_json(url, timeout=10):
+        assert url == f"{demo.INGEST_URL}/status?split=train&pipeline_id=stage-demo"
+        return {"available": False, "pipeline_id": "stage-demo"}
+
+    monkeypatch.setattr(demo, "get_json", fake_get_json)
+
+    with pytest.raises(SystemExit) as exc:
+        demo.ensure_raw_data_available("train", "stage-demo", 200)
+
+    message = str(exc.value)
+    assert "preprocess-only mode requires existing raw data" in message
+    assert "python demo.py --stage ingest --samples 200 --split train --pipeline-id stage-demo" in message
+    assert "python demo.py --stage pipeline --samples 200 --split train --pipeline-id stage-demo" in message
+
+
+def test_ensure_preprocessed_data_available_exits_before_backend(monkeypatch):
+    def fake_get_json(url, timeout=10):
+        assert url == f"{demo.PREPROC_URL}/status?split=train&pipeline_id=stage-demo"
+        return {"available": False, "pipeline_id": "stage-demo"}
+
+    monkeypatch.setattr(demo, "get_json", fake_get_json)
+
+    with pytest.raises(SystemExit) as exc:
+        demo.ensure_preprocessed_data_available("train", "stage-demo", 100)
+
+    message = str(exc.value)
+    assert "train-only mode requires existing preprocessed data" in message
+    assert "python demo.py --stage pipeline --samples 100 --split train --pipeline-id stage-demo" in message
+    assert "python demo.py --samples 100 --train --split train --pipeline-id stage-demo" in message
+
+
+def test_main_train_stage_exits_before_backend_when_preprocessed_data_missing(monkeypatch):
+    parsed_args = type(
+        "Args",
+        (),
+        {
+            "samples": 100,
+            "split": "train",
+            "pipeline_id": "stage-demo",
+            "train": False,
+            "stage": "train",
+            "train_epochs": 1,
+            "predict_text": "Loved it.",
+            "health_timeout": 10,
+        },
+    )()
+    calls = []
+
+    monkeypatch.setattr(demo, "parse_args", lambda: parsed_args)
+    monkeypatch.setattr(demo, "h1", lambda *_: None)
+    monkeypatch.setattr(demo, "info", lambda *_: None)
+    monkeypatch.setattr(demo, "warn", lambda msg: calls.append(("warn", msg)))
+    monkeypatch.setattr(demo, "wait_for_services", lambda timeout: calls.append(("health", timeout)))
+    monkeypatch.setattr(
+        demo,
+        "ensure_preprocessed_data_available",
+        lambda split, pipeline_id, samples: (_ for _ in ()).throw(
+            SystemExit("missing preprocessed data")
+        ),
+    )
+    monkeypatch.setattr(demo, "run_training", lambda *args: calls.append(("train", args)))
+    monkeypatch.setattr(demo, "run_inference_smoke", lambda *args: calls.append(("predict", args)))
+    monkeypatch.setattr(demo, "show_lineage", lambda pipeline_id: calls.append(("lineage", pipeline_id)))
+    monkeypatch.setattr(demo, "show_pipeline_status", lambda pipeline_id: calls.append(("status", pipeline_id)))
+    monkeypatch.setattr(demo, "prove_provenance", lambda pipeline_id: calls.append(("proof", pipeline_id)))
+    monkeypatch.setattr(demo, "print_summary", lambda pipeline_id: calls.append(("summary", pipeline_id)))
+
+    with pytest.raises(SystemExit, match="missing preprocessed data"):
+        demo.main()
+
+    assert calls == [
+        ("health", 10),
+        ("warn", "Train-only mode expects preprocessed data for this pipeline and split to already exist."),
     ]

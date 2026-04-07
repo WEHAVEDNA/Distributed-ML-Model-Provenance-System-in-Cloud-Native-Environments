@@ -37,7 +37,10 @@ function Check-Health {
     foreach ($svc in $services) {
         try {
             $r = Invoke-RestMethod $svc.url -TimeoutSec 5
-            Write-Host "  [OK] $($svc.name)" -ForegroundColor Green
+            $details = @("mode=$($r.deployment_mode)")
+            if ($r.pod_name) { $details += "pod=$($r.pod_name)" }
+            if ($r.node_name) { $details += "node=$($r.node_name)" }
+            Write-Host "  [OK] $($svc.name)  $($details -join '  ')" -ForegroundColor Green
         } catch {
             Write-Host "  [DOWN] $($svc.name)" -ForegroundColor Red
             $ok = $false

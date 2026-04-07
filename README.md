@@ -70,18 +70,48 @@ All services are FastAPI with async background jobs. Storage is MinIO (local) or
 
 **Prerequisites:** Docker Desktop, Python 3.11+
 
+Choose one local runtime:
+
+### Option A — Docker Compose
+
 ```powershell
 # 1. Start the local stack and keep this terminal open
 #    first build is the slowest because atlas-sidecar compiles atlas-cli from Rust
 docker compose --progress plain up --build
+```
 
-# 2. In a new terminal, optionally verify all four /health endpoints return "ok"
+### Option B — Kubernetes on Docker Desktop
+
+```bat
+scripts\setup_k8s_docker_desktop.bat
+```
+
+That batched Windows wrapper builds the images and deploys the Kubernetes stack.
+In Docker Desktop mode it now clears the existing Kubernetes service deployments and waits for their old pods to disappear first, so each startup comes up on fresh pods instead of reusing leftovers from the previous run.
+After deployment it keeps the same terminal attached to a live Kubernetes pod-status stream instead of opening a second terminal automatically.
+
+Then start the localhost port-forwards manually in the terminal where you want them to run:
+
+```powershell
+pwsh scripts\port_forward.ps1
+```
+
+If you only want the deploy step without the live watcher:
+
+```bat
+scripts\setup_k8s_docker_desktop.bat --no-watch
+```
+
+### Common next steps
+
+```powershell
+# 1. In a new terminal, optionally verify all four /health endpoints return "ok"
 Invoke-RestMethod http://localhost:8001/health
 Invoke-RestMethod http://localhost:8002/health
 Invoke-RestMethod http://localhost:8003/health
 Invoke-RestMethod http://localhost:8004/health
 
-# 3. Run the demo in a separate terminal
+# 2. Run the demo in a separate terminal
 #    default demo: ingestion + preprocessing only
 python demo.py --samples 200 --pipeline-id demo-200
 
@@ -105,12 +135,12 @@ python demo.py --stage preprocess --pipeline-id stage-demo
 #    expects preprocessed data for stage-demo to already exist
 python demo.py --stage train --pipeline-id stage-demo --predict-text "Loved it."
 
-# 4. Optionally verify provenance after a full run
+# 3. Optionally verify provenance after a full run
 Invoke-RestMethod "http://localhost:8004/lineage?pipeline_id=demo-500"
 Invoke-RestMethod "http://localhost:8004/pipeline/status?pipeline_id=demo-500"
 Invoke-RestMethod "http://localhost:8004/registry?pipeline_id=demo-500"
 
-# 5. Optionally run tests
+# 4. Optionally run tests
 pytest tests/ -v -m smoke                  # fast schema/health checks only
 pytest tests/ -v -m "wired" --samples 200  # provenance chain after pipeline
 pytest tests/ -v -m slow --samples 500     # full suite including fine-tuning
@@ -119,8 +149,10 @@ pytest tests/ -v -m slow --samples 500     # full suite including fine-tuning
 See [SETUP.md](SETUP.md) for step-by-step recreation instructions.
 
 Notes:
-- Keep `docker compose up --build` running while you use the demo, scripts, or tests.
+- Keep the selected backend running while you use the demo, scripts, or tests: either the `docker compose up --build` terminal or the Kubernetes watch terminal started by `scripts\setup_k8s_docker_desktop.bat`, plus a separate terminal running `pwsh scripts\port_forward.ps1` for localhost access.
+- Do not leave both local backends active on the same ports at the same time. Stop Compose before using the Kubernetes port-forwards, and stop the Kubernetes port-forwards before switching back to Compose.
 - `demo.py` now waits for service health automatically before starting the pipeline.
+- When the backend is Kubernetes, `demo.py` now prints `Runtime backend: kubernetes` and includes each service pod and node in the health section so localhost traffic is clearly identified as a port-forward into the cluster.
 - `demo.py` is self-contained. You do not need to run the test suite before running the demo.
 - `demo.py --train` now defaults to `1` epoch to keep the demo shorter. Use `--train-epochs 3` for the longer full training run.
 - `demo.py --stage pipeline` runs ingestion + preprocessing only.
@@ -148,28 +180,85 @@ Use Kubernetes when:
 
 ### Kubernetes Migration Path
 
+Docker Desktop is the simplest local cluster target because the cluster can use images built by the local Docker daemon directly.
+
 The repository keeps Docker as the source-of-truth local environment, while the `k8s/` directory mirrors the same services for staged migration.
 
+For Windows, the batched Kubernetes setup is:
+
+```bat
+scripts\setup_k8s_docker_desktop.bat
+```
+
+That wrapper builds the images, deploys the Kubernetes stack, then streams `kubectl get pods -w` in the same terminal.
+
 ```powershell
-# 1. Build images for a local cluster
-pwsh scripts/build_images.ps1 -Minikube
-# or
-pwsh scripts/build_images.ps1 -Kind -KindCluster kind
+# 0. Enable Kubernetes in Docker Desktop and switch context once
+kubectl config use-context docker-desktop
 
-# 2. Apply manifests
-pwsh scripts/deploy_k8s.ps1
+# 1. Build local images into Docker Desktop's image store
+pwsh scripts/build_images.ps1 -DockerDesktop
 
-# 3. Port-forward services for the existing demo/tests
-kubectl port-forward -n ml-pipeline svc/data-ingestion 8001:8001
-kubectl port-forward -n ml-pipeline svc/preprocessing 8002:8002
-kubectl port-forward -n ml-pipeline svc/fine-tuning 8003:8003
-kubectl port-forward -n ml-pipeline svc/atlas-sidecar 8004:8004
+# 2. Apply the stack and patch the four local service deployments
+pwsh scripts/deploy_k8s.ps1 -DockerDesktop
+
+# or do both in one step
+pwsh scripts/deploy_k8s.ps1 -BuildImages -DockerDesktop
+
+# 3. Start the localhost port-forwards in the current terminal
+pwsh scripts/port_forward.ps1
 ```
 
 Notes:
 - `k8s/kustomization.yaml` lets you deploy the full stack with `kubectl apply -k k8s`.
+- `pwsh scripts/deploy_k8s.ps1 -DockerDesktop` now enforces the `docker-desktop` context, applies the Kubernetes manifests with the four local service deployments already set to `imagePullPolicy: Never`, and waits for `minio-init` to complete.
+- In Docker Desktop mode, the deploy script deletes the existing `minio`, `atlas-sidecar`, `data-ingestion`, `preprocessing`, and `fine-tuning` deployments plus the `minio-init` job before reapplying manifests, then waits for the old pods to terminate. That gives you a clean local-cluster start without stale pods lingering or a second rollout caused by post-apply patching.
+- `scripts\setup_k8s_docker_desktop.bat` is the one-shot Windows Kubernetes deploy entrypoint. It now streams `kubectl get pods -w` in the same terminal after deployment. Start port-forwards manually with `pwsh scripts\port_forward.ps1`, stop them later with `scripts\stop_k8s_port_forward.bat`, and use `scripts\setup_k8s_docker_desktop.bat --no-watch` if you only want the deploy step.
+- The Kubernetes config now matches the Compose environment contract for pipeline IDs, root prefixes, model artifact naming, and sidecar stage ordering.
 - The HuggingFace cache PVC defaults to `ReadWriteOnce` for local-cluster compatibility. If you move to a multi-node cluster and want a truly shared cache, switch that PVC to a storage class that supports `ReadWriteMany`.
 - `scripts/build_and_push.sh` now builds all four service images, including `atlas-sidecar`, so the Kubernetes manifests and Docker Compose use the same container set.
+- If you want Minikube or kind instead, the existing `-Minikube` and `-Kind` script paths still work.
+
+### Stopping And Switching
+
+Stop Docker Compose:
+
+```powershell
+docker compose down
+```
+
+Stop Docker Compose and remove local volumes:
+
+```powershell
+docker compose down -v
+```
+
+Stop Kubernetes localhost port-forwards only:
+
+```bat
+scripts\stop_k8s_port_forward.bat
+```
+
+Remove the Kubernetes stack from the Docker Desktop cluster:
+
+```powershell
+kubectl delete -k k8s
+```
+
+Switch from Docker Compose to Kubernetes:
+
+```powershell
+docker compose down
+scripts\setup_k8s_docker_desktop.bat
+```
+
+Switch from Kubernetes back to Docker Compose:
+
+```powershell
+scripts\stop_k8s_port_forward.bat
+kubectl delete -k k8s
+docker compose --progress plain up --build
+```
 
 ---
 
@@ -179,7 +268,7 @@ Notes:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `:8001/health` | Liveness |
+| GET | `:8001/health` | Liveness + deployment mode and runtime location metadata |
 | POST | `:8001/ingest?split=train&num_samples=500&pipeline_id=default` | Start ingestion job |
 | GET | `:8001/jobs/{id}` | Poll job status |
 | POST | `:8001/jobs/{id}/cancel` | Request cancellation for an ingestion job |
@@ -197,12 +286,12 @@ Notes:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `:8004/health` | Liveness + cached atlas-cli version + key status |
+| GET | `:8004/health` | Liveness + cached atlas-cli version + key status + deployment mode and runtime location metadata |
 | POST | `:8004/collect/dataset` | Register dataset artifact, create C2PA manifest |
 | POST | `:8004/collect/pipeline` | Register pipeline-step SLSA provenance |
 | POST | `:8004/collect/model` | Register model artifact, link to dataset manifests |
-| GET | `:8004/lineage?pipeline_id=default` | Ordered provenance chain for one pipeline |
-| GET | `:8004/pipeline/status?pipeline_id=default` | Per-stage manifest counts and completion flags |
+| GET | `:8004/lineage?pipeline_id=default` | Ordered sidecar-tracked pipeline history, including pipeline-step records |
+| GET | `:8004/pipeline/status?pipeline_id=default` | Per-stage tracked-record counts, manifest counts, and completion flags |
 | GET | `:8004/registry?pipeline_id=default` | Tracked artifacts for one pipeline |
 | GET | `:8004/pipelines` | Summary of all known pipeline IDs in the registry |
 | GET | `:8004/export/{manifest_id}` | Export full provenance graph as JSON |
@@ -218,6 +307,8 @@ Each pipeline service exposes `GET /provenance?pipeline_id=...` returning the ma
 | data-ingestion | `:8001/provenance` |
 | preprocessing | `:8002/provenance` |
 | fine-tuning | `:8003/provenance` |
+
+`/lineage` entries always include a sidecar `tracking_id`. Exportable Atlas/C2PA objects also include `manifest_id`. When `atlas-cli pipeline generate-provenance` does not return a resolvable URN, the sidecar creates an explicit pipeline-step manifest and links it to the upstream inputs.
 
 ---
 

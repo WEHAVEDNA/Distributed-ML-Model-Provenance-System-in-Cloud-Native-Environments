@@ -108,8 +108,12 @@ def wait_for_job(base_url: str, job_id: str, timeout: int) -> dict:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def ensure_services_ready():
+def ensure_services_ready(request):
     """Wait for all service health endpoints before running integration tests."""
+    items = getattr(request.session, "items", [])
+    if items and all(item.get_closest_marker("unit") for item in items):
+        return
+
     deadline = time.time() + HEALTHCHECK_TIMEOUT
     while time.time() < deadline:
         all_ready = True
