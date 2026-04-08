@@ -11,6 +11,10 @@ Demo 2 presentation: https://docs.google.com/presentation/d/1WfeDlM877Tw3Msrw_t-
 
 Demo 2 video: https://drive.google.com/file/d/1iPYX0nW1rNNxc22FYdzfefnvu_PNE1oM/view?usp=sharing
 
+Demo 3 presentation: https://docs.google.com/presentation/d/1WfeDlM877Tw3Msrw_t-0FO3Swb3vk92SMZvVm914wR0/edit?usp=sharing
+
+Demo 3 video: https://drive.google.com/file/d/1BLxXcpIp_xUrE9GHFw9CGTNGA9couwYI/view?usp=sharing
+
 ---
 
 ## Overview
